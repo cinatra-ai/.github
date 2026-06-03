@@ -15,7 +15,7 @@
 //   3. Dependency-ordering gate: every @cinatra-ai/* dep must already be
 //      PUBLISHED on registry.cinatra.ai — fail BEFORE submit otherwise.
 //   4. sha256 + size; base64.
-//   5. Call `cinatra/extension-submit-for-review` over MCP with the exact bytes.
+//   5. Call `cinatra-extension-submit-for-review` over MCP with the exact bytes.
 //
 // Token: CINATRA_MARKETPLACE_VENDOR_TOKEN (the submit-scope GitHub org secret).
 //
@@ -168,7 +168,7 @@ async function submitTarball({ tarballPath, description, skipDependencyCheck }) 
     await client.connect(transport);
     process.stderr.write(`Submitting ${manifest.name}@${version} (${artifactSizeBytes} bytes) to the Cinatra Marketplace…\n`);
     const result = await client.callTool({
-      name: "cinatra/extension-submit-for-review",
+      name: "cinatra-extension-submit-for-review",
       arguments: {
         namespace,
         extension_name: extensionName,
