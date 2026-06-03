@@ -62,6 +62,20 @@ function authHeader(token) {
   return { authorization: /^(Bearer|Basic)\s/i.test(token) ? token : `Bearer ${token}` };
 }
 
+// Vendor SUBMIT auth (the marketplace MCP). CINATRA_MARKETPLACE_VENDOR_TOKEN may be
+// a full "Basic …"/"Bearer …" header OR a RAW WordPress application password (what
+// the wp-admin UI / Infisical hold). For a raw value, build HTTP Basic
+// base64("<vendor-user>:<app-pw>") — WP application-password auth; the user defaults
+// to the first-party vendor `cinatra-ai` (override via CINATRA_MARKETPLACE_VENDOR_USER).
+// (The registry probe keeps authHeader()'s Bearer-by-default — that token is a
+// registry read token, not a WP app-password.)
+function vendorAuthHeader(token) {
+  if (!token) return {};
+  if (/^(Bearer|Basic)\s/i.test(token)) return { authorization: token };
+  const user = process.env.CINATRA_MARKETPLACE_VENDOR_USER || "cinatra-ai";
+  return { authorization: `Basic ${Buffer.from(`${user}:${token}`).toString("base64")}` };
+}
+
 export async function probeDep(dep, { registryUrl, token, fetchImpl }) {
   const url = `${String(registryUrl).replace(/\/+$/, "")}/${dep.name.replace("/", "%2F")}`;
   let res;
@@ -161,7 +175,7 @@ async function submitTarball({ tarballPath, description, skipDependencyCheck }) 
   const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
   const { StreamableHTTPClientTransport } = await import("@modelcontextprotocol/sdk/client/streamableHttp.js");
   const transport = new StreamableHTTPClientTransport(new URL(baseUrl + MCP_ROUTE), {
-    requestInit: { headers: authHeader(token) },
+    requestInit: { headers: vendorAuthHeader(token) },
   });
   const client = new Client({ name: "cinatra-release-submit", version: "1.0.0" });
   try {
