@@ -12,17 +12,22 @@
 // Flow:
 //   1. Read the CI-built tarball bytes.
 //   2. Derive name + version from the tarball's package.json (pacote).
-//   3. Dependency-ordering gate: every @cinatra-ai/* dep must already be
-//      PUBLISHED on registry.cinatra.ai — fail BEFORE submit otherwise.
+//   3. Dependency-ordering gate: every @cinatra-ai/* EXTENSION EDGE declared in the
+//      manifest's canonical `cinatra.dependencies` must already be present on
+//      registry.cinatra.ai (the authenticated install-backend) — which happens by
+//      publishing it THROUGH the marketplace, never by direct registry publish —
+//      fail BEFORE submit otherwise. Host-internal SDK/app peers are host-provided
+//      under model-B and are SKIPPED (never on the registry).
 //   4. sha256 + size; base64.
 //   5. Call `cinatra-extension-submit-for-review` over MCP with the exact bytes.
 //
 // Token: CINATRA_MARKETPLACE_VENDOR_TOKEN (the submit-scope GitHub org secret).
 //
 // Gate scope vs. the dev CLI: this portable gate is EXISTENCE-based — it asks
-// "is every @cinatra-ai/* dependency published on the registry at all?", which is
-// the ordering guarantee that matters (a public repo can't install an unpublished
-// dep). It deliberately does NOT do semver range-satisfaction; the marketplace
+// "is every @cinatra-ai/* EXTENSION EDGE (cinatra.dependencies) published on the
+// registry at all?", which is the ordering guarantee that matters (a public repo
+// can't install an unpublished sibling extension). It deliberately does NOT do
+// semver range-satisfaction; the marketplace
 // re-validates exact version compatibility at approval, and the dev-side
 // packages/cli/src/extensions-dependency-gate.mjs adds the semver-aware check for
 // local use. Keep the 401-vs-404 classification below in lock-step with that
@@ -31,12 +36,19 @@
 
 import { readFile } from "node:fs/promises";
 import { resolve as resolvePath } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 
 export const CINATRA_SCOPE = "@cinatra-ai/";
 export const DEFAULT_REGISTRY_URL = "https://registry.cinatra.ai";
 export const MARKETPLACE_BASE_URL = "https://marketplace.cinatra.ai";
 const MCP_ROUTE = "/wp-json/cinatra/mcp";
+// The submit MCP call runs the promotion saga INLINE (stage-publish → final-publish →
+// verify-digest → storefront read-back), which can exceed the MCP SDK's 60s default
+// request timeout under rate-limit backoff or registry/WooCommerce slowness. Use a
+// generous explicit timeout so a slow-but-succeeding publish is never falsely reported
+// as a failure. Override via CINATRA_SUBMIT_TIMEOUT_MS.
+const SUBMIT_TIMEOUT_MS = Number(process.env.CINATRA_SUBMIT_TIMEOUT_MS || 600_000);
 
 // --- dependency-ordering gate (existence-based; mirror of the 401-vs-404
 //     classification in packages/cli/src/extensions-dependency-gate.mjs) -------
@@ -57,6 +69,57 @@ export function extractCinatraDeps(manifest) {
   return out;
 }
 
+// Canonical cross-extension edge names from the manifest's `cinatra.dependencies`
+// (array of `{packageName}`, array of strings, or a name→spec object). Mirrors
+// scripts/marketplace/extension-wave-runner.mjs `extractCinatraManifestDepNames`.
+// This is the AUTHORITATIVE extension-edge set: only these @cinatra-ai/* deps are
+// real marketplace dependencies that must be on the registry first. Host-internal
+// SDK/app packages (sdk-extensions, sdk-ui, mcp-client, …) are NEVER declared here —
+// under model-B they are host-provided OPTIONAL peers, intentionally not on any
+// registry, so the ordering gate must SKIP them (probing would 404/401).
+export function extractCinatraManifestDepNames(manifest) {
+  const c = manifest?.cinatra?.dependencies;
+  const out = new Set();
+  if (Array.isArray(c)) {
+    for (const e of c) {
+      if (e && typeof e === "object" && typeof e.packageName === "string") out.add(e.packageName);
+      else if (typeof e === "string") out.add(e.startsWith("@") ? e : `${CINATRA_SCOPE}${e}`);
+    }
+  } else if (c && typeof c === "object") {
+    for (const k of Object.keys(c)) out.add(k);
+  }
+  return [...out];
+}
+
+// Select which @cinatra-ai/* deps the ordering gate must verify on the registry:
+// ONLY the canonical extension edges declared in `cinatra.dependencies`. An npm
+// dep/peer that is NOT a declared edge is host-internal (a host-provided peer) and
+// is SKIPPED. An edge declared ONLY in `cinatra.dependencies` (no npm dep entry —
+// e.g. linkedin→social-media, resend→email) is still probed with range "*".
+// `skippedNonManifestCinatraDeps` surfaces the excluded names for transparency
+// (a precise label: an authoring error that omits a real edge from
+// `cinatra.dependencies` would land here, not "host-internal" overclaim).
+export function selectExtensionDepsToProbe(manifest) {
+  const edgeNames = new Set(extractCinatraManifestDepNames(manifest));
+  const npmDeps = extractCinatraDeps(manifest);
+  const toProbe = [];
+  const seen = new Set();
+  for (const d of npmDeps) {
+    if (edgeNames.has(d.name) && !seen.has(d.name)) {
+      toProbe.push(d);
+      seen.add(d.name);
+    }
+  }
+  for (const name of edgeNames) {
+    if (!seen.has(name)) {
+      toProbe.push({ name, range: "*", field: "cinatra.dependencies" });
+      seen.add(name);
+    }
+  }
+  const skippedNonManifestCinatraDeps = npmDeps.filter((d) => !edgeNames.has(d.name)).map((d) => d.name);
+  return { toProbe, skippedNonManifestCinatraDeps };
+}
+
 function authHeader(token) {
   if (!token) return {};
   return { authorization: /^(Bearer|Basic)\s/i.test(token) ? token : `Bearer ${token}` };
@@ -69,11 +132,50 @@ function authHeader(token) {
 // to the first-party vendor `cinatra-ai` (override via CINATRA_MARKETPLACE_VENDOR_USER).
 // (The registry probe keeps authHeader()'s Bearer-by-default — that token is a
 // registry read token, not a WP app-password.)
-function vendorAuthHeader(token) {
+export function vendorAuthHeader(token) {
   if (!token) return {};
   if (/^(Bearer|Basic)\s/i.test(token)) return { authorization: token };
   const user = process.env.CINATRA_MARKETPLACE_VENDOR_USER || "cinatra-ai";
   return { authorization: `Basic ${Buffer.from(`${user}:${token}`).toString("base64")}` };
+}
+
+// --- submit outcome classification ------------------------------------------
+// A submit that returns no MCP `isError` is NOT necessarily a published listing.
+// On the auto-approve path the inline promotion saga can finish HALF-FAILED:
+// status='approved' + promotion_state='failed' (the storefront read-back failed, the
+// row stays unlisted and is queued for retry/dead-letter) — returned as a normal 200,
+// no isError. Terminal SUCCESS is status='promoted' + promotion_state='complete'
+// (Store::markPromoted). Pending moderation (auto-approve off / separation-of-duties)
+// is status='pending' with no promotion_state — legitimate, not a failure.
+export function classifySubmissionOutcome({ status, promotionState } = {}) {
+  const s = String(status ?? "").toLowerCase();
+  const p = promotionState != null ? String(promotionState).toLowerCase() : null;
+  if (s === "promoted" && p === "complete") return { kind: "listed" };
+  if (p === "failed") {
+    return { kind: "failed", reason: "promotion_state=failed (stays approved+failed, queued for retry/dead-letter)" };
+  }
+  if (s === "pending") return { kind: "pending", reason: "awaiting moderation (auto-approve off or separation-of-duties)" };
+  return { kind: "unconfirmed", reason: `status=${status ?? "?"}, promotion_state=${promotionState ?? "n/a"}` };
+}
+
+// Throw on a definitive promotion failure; warn (do not throw) on a not-yet-terminal
+// state so the legitimate pending/in_flight paths still exit 0. The authoritative
+// per-extension confirmation is the post-wave reconciliation pass.
+export function assertSubmissionOutcome({ submissionId, status, promotionState } = {}) {
+  const outcome = classifySubmissionOutcome({ status, promotionState });
+  if (outcome.kind === "failed") {
+    throw new Error(
+      `Submission ${submissionId ?? "?"} was accepted (status=${status ?? "?"}) but ${outcome.reason} — ` +
+        "the extension is NOT a renderable storefront listing. Reconcile before treating it as published.",
+    );
+  }
+  if (outcome.kind !== "listed") {
+    process.stderr.write(
+      `⚠ Submission ${submissionId ?? "?"} accepted but NOT confirmed-listed (${outcome.reason}). ` +
+        "Expected status=promoted + promotion_state=complete. Verify via reconciliation.\n",
+    );
+  }
+  return outcome;
 }
 
 export async function probeDep(dep, { registryUrl, token, fetchImpl }) {
@@ -106,7 +208,9 @@ export async function checkDependencyOrdering({
   fetchImpl = globalThis.fetch,
 } = {}) {
   if (typeof fetchImpl !== "function") throw new Error("checkDependencyOrdering: no fetch implementation available");
-  const deps = extractCinatraDeps(manifest);
+  // Probe ONLY canonical extension edges (cinatra.dependencies); host-internal
+  // @cinatra-ai/* peers are host-provided under model-B and never on the registry.
+  const { toProbe: deps, skippedNonManifestCinatraDeps } = selectExtensionDepsToProbe(manifest);
   const results = [];
   for (const dep of deps) results.push(await probeDep(dep, { registryUrl, token, fetchImpl }));
   const missing = results.filter((r) => r.state === "missing");
@@ -114,7 +218,7 @@ export async function checkDependencyOrdering({
   const errored = results.filter((r) => r.state === "error");
   return {
     ok: missing.length === 0 && unreadable.length === 0 && errored.length === 0,
-    registryUrl, deps, results, missing, unreadable, errored,
+    registryUrl, deps, skippedNonManifestCinatraDeps, results, missing, unreadable, errored,
     satisfied: results.filter((r) => r.state === "satisfied"),
   };
 }
@@ -124,12 +228,12 @@ export function formatGateFailure(report) {
   if (report.missing.length > 0) {
     lines.push(`Dependency-ordering gate FAILED — ${report.missing.length} @cinatra-ai/* dependency(ies) not on ${report.registryUrl}:`);
     for (const m of report.missing) lines.push(`  • ${m.name}@${m.range} [${m.field}] — ${m.detail || "missing"}`);
-    lines.push("Publish the package's @cinatra-ai/* closure (in dependency order) through the marketplace path FIRST, then re-submit.");
+    lines.push("Publish the missing @cinatra-ai/* dependency extension(s) (in dependency order) THROUGH the marketplace storefront FIRST, then re-submit. (These are dependency extensions, not the host SDK.)");
   }
   if (report.unreadable.length > 0) {
     lines.push(`Dependency-ordering gate could NOT verify — ${report.registryUrl} returned ${report.unreadable[0].status} (registry not readable):`);
     for (const u of report.unreadable) lines.push(`  • ${u.name}@${u.range} [${u.field}]`);
-    lines.push("The registry's public-read is not enabled, or no read token is set. Export CINATRA_REGISTRY_TOKEN or wait for the public-read flip.");
+    lines.push("registry.cinatra.ai requires authentication by design — export a read-scope CINATRA_REGISTRY_TOKEN, then re-run. (Use --skip-dependency-check only if you have independently confirmed the closure is published.)");
   }
   if (report.errored.length > 0) {
     lines.push(`Dependency-ordering gate hit ${report.errored.length} registry error(s):`);
@@ -160,7 +264,13 @@ async function submitTarball({ tarballPath, description, skipDependencyCheck }) 
 
   if (!skipDependencyCheck) {
     const registryUrl = (process.env.CINATRA_REGISTRY_URL || DEFAULT_REGISTRY_URL).trim();
-    await assertDependencyOrdering({ manifest, registryUrl, token: process.env.CINATRA_REGISTRY_TOKEN });
+    const report = await assertDependencyOrdering({ manifest, registryUrl, token: process.env.CINATRA_REGISTRY_TOKEN });
+    const skipped = report?.skippedNonManifestCinatraDeps ?? [];
+    if (skipped.length > 0) {
+      process.stderr.write(
+        `ℹ dependency-ordering gate: skipped ${skipped.length} host-provided @cinatra-ai/* peer(s) not declared as an extension edge in cinatra.dependencies (model-B host-internal — the host supplies them at install/runtime): ${skipped.join(", ")}\n`,
+      );
+    }
   } else {
     process.stderr.write("⚠ --skip-dependency-check: bypassing the @cinatra-ai/* dependency-ordering gate.\n");
   }
@@ -181,24 +291,34 @@ async function submitTarball({ tarballPath, description, skipDependencyCheck }) 
   try {
     await client.connect(transport);
     process.stderr.write(`Submitting ${manifest.name}@${version} (${artifactSizeBytes} bytes) to the Cinatra Marketplace…\n`);
-    const result = await client.callTool({
-      name: "cinatra-extension-submit-for-review",
-      arguments: {
-        namespace,
-        extension_name: extensionName,
-        version,
-        artifact_digest_sha256: artifactDigestSha256,
-        artifact_size_bytes: artifactSizeBytes,
-        tarball_base64: tarballBytes.toString("base64"),
-        ...(description ? { description } : {}),
+    const result = await client.callTool(
+      {
+        name: "cinatra-extension-submit-for-review",
+        arguments: {
+          namespace,
+          extension_name: extensionName,
+          version,
+          artifact_digest_sha256: artifactDigestSha256,
+          artifact_size_bytes: artifactSizeBytes,
+          tarball_base64: tarballBytes.toString("base64"),
+          ...(description ? { description } : {}),
+        },
       },
-    });
+      // resultSchema: keep the SDK default (pass undefined, not null).
+      undefined,
+      { timeout: SUBMIT_TIMEOUT_MS },
+    );
     if (result?.isError) {
       const txt = Array.isArray(result.content) ? result.content.find((c) => c.type === "text")?.text : null;
       throw new Error(`extension-submit-for-review error: ${txt ?? "unknown"}`);
     }
     const out = result?.structuredContent ?? {};
-    process.stdout.write(`submission_id: ${out.submission_id ?? "?"}\nstatus: ${out.status ?? "?"}\n`);
+    const submissionId = out.submission_id ?? "?";
+    const status = String(out.status ?? "?");
+    // promotion_state is present only on the auto-approve path (the inline saga ran).
+    const promotionState = out.promotion_state != null ? String(out.promotion_state) : null;
+    process.stdout.write(`submission_id: ${submissionId}\nstatus: ${status}\npromotion_state: ${promotionState ?? "n/a"}\n`);
+    assertSubmissionOutcome({ submissionId, status, promotionState });
   } finally {
     await client.close().catch(() => {});
   }
@@ -220,7 +340,7 @@ async function main() {
 }
 
 const invokedDirectly =
-  process.argv[1] && resolvePath(process.argv[1]) === resolvePath(new URL(import.meta.url).pathname);
+  process.argv[1] && resolvePath(process.argv[1]) === resolvePath(fileURLToPath(import.meta.url));
 if (invokedDirectly) {
   main().catch((err) => {
     console.error(err instanceof Error ? err.message : String(err));
