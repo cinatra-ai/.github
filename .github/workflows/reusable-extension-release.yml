@@ -193,7 +193,13 @@ jobs:
         if: steps.gate.outputs.should_publish == 'true'
         run: |
           set -euo pipefail
-          npm install --no-save --no-package-lock --ignore-scripts pacote@^21 @modelcontextprotocol/sdk@^1.29.0
+          # Install the submit tool's two public deps INSIDE the .cinatra-release
+          # sparse checkout (which has NO package.json) — never the extension root —
+          # so npm never resolves the extension's peer graph (a UI connector's
+          # react + @cinatra-ai/sdk-* peers crash npm's resolver: ERESOLVE → null).
+          # release-submit.mjs lives under .cinatra-release/, so its ESM `import`
+          # resolves pacote/MCP from .cinatra-release/node_modules (an ancestor).
+          cd .cinatra-release && npm install --no-save --no-package-lock --ignore-scripts pacote@^21 @modelcontextprotocol/sdk@^1.29.0
 
       - name: Submit through the marketplace proxy (dependency-gated, source-identity-signed)
         if: steps.gate.outputs.should_publish == 'true'
