@@ -97,8 +97,27 @@ jobs:
       # Install with the committed lockfile when present; extracted repos ship
       # none today, so fall back to a fresh resolve. (Committing a per-repo
       # lockfile is a deferred hardening — see README.md.)
-      - name: Install
+      # Host-coupled extensions (connectors) peer-depend on host-internal
+      # @cinatra-ai/* SDK packages (sdk-extensions, sdk-ui, mcp-client, …) that are
+      # NEVER on a public registry (model-B: the host provides them at runtime).
+      # They therefore cannot be installed / typechecked / tested standalone — the
+      # monorepo owns those gates — so a `pnpm install` here 404s on the optional
+      # peer (auto-install-peers=false is unreliable across pnpm/CI). Detect via a
+      # first-party peerDependency and skip install/typecheck/test for them; the
+      # kind gate + `npm pack` + submit need no node_modules.
+      - name: Classify extension
+        id: classify
         if: steps.gate.outputs.should_publish == 'true'
+        run: |
+          if node -e "p=require('./package.json');pd=p.peerDependencies||{};process.exit(Object.keys(pd).some(k=>k.startsWith('@cinatra-ai/'))?0:1)"; then
+            echo "host_coupled=true" >> "$GITHUB_OUTPUT"
+            echo "host-coupled extension (first-party peer deps) — install/typecheck/test skipped; the host owns those gates."
+          else
+            echo "host_coupled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install
+        if: steps.gate.outputs.should_publish == 'true' && steps.classify.outputs.host_coupled != 'true'
         run: |
           if [ -f pnpm-lock.yaml ]; then
             corepack pnpm install --frozen-lockfile
@@ -107,7 +126,7 @@ jobs:
           fi
 
       - name: Typecheck
-        if: steps.gate.outputs.should_publish == 'true'
+        if: steps.gate.outputs.should_publish == 'true' && steps.classify.outputs.host_coupled != 'true'
         run: |
           if node -e "process.exit(((require('./package.json').scripts)||{}).typecheck?0:1)"; then
             corepack pnpm run typecheck
@@ -118,7 +137,7 @@ jobs:
           fi
 
       - name: Test
-        if: steps.gate.outputs.should_publish == 'true'
+        if: steps.gate.outputs.should_publish == 'true' && steps.classify.outputs.host_coupled != 'true'
         run: corepack pnpm test --if-present
 
       # Self-contained per-kind gate shipped into agent/workflow repos.
