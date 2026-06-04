@@ -42,7 +42,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write       # provenance attestation (OIDC)
+      id-token: write       # OIDC — provenance attestation AND source-identity token mint
       attestations: write   # provenance attestation
     steps:
       # The extension repo at the release tag.
@@ -161,13 +161,56 @@ jobs:
             scripts/v622/templates/release/release-submit.mjs
           sparse-checkout-cone-mode: false
 
-      - name: Submit through the marketplace proxy (dependency-gated)
+      # Install the two public runtime deps release-submit.mjs lazy-imports
+      # (pacote + the MCP SDK). The job grants `id-token: write` (for provenance
+      # AND the source-identity mint below), so the runner exposes
+      # ACTIONS_ID_TOKEN_REQUEST_* to EVERY step — a per-step `env:` cannot remove a
+      # job-level permission. So harden the install itself: `--ignore-scripts` runs
+      # NO lifecycle/postinstall code (pacote + the MCP SDK need none), so an
+      # untrusted transitive dependency cannot execute code to mint/exfiltrate an
+      # OIDC token here; blanking the request vars is belt-and-suspenders. The
+      # token is minted ONLY in the guarded submit step that immediately follows.
+      - name: Install submit-tool deps
         if: steps.gate.outputs.should_publish == 'true'
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_URL: ""
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
         run: |
           set -euo pipefail
-          # release-submit.mjs lazy-imports only these two public deps.
-          npm install --no-save --no-package-lock pacote@^21 @modelcontextprotocol/sdk@^1.29.0
-          node .cinatra-release/scripts/v622/templates/release/release-submit.mjs "${{ steps.pack.outputs.tarball }}"
+          npm install --no-save --no-package-lock --ignore-scripts pacote@^21 @modelcontextprotocol/sdk@^1.29.0
+
+      - name: Submit through the marketplace proxy (dependency-gated, source-identity-signed)
+        if: steps.gate.outputs.should_publish == 'true'
         env:
           CINATRA_MARKETPLACE_VENDOR_TOKEN: ${{ secrets.CINATRA_MARKETPLACE_VENDOR_TOKEN }}
           CINATRA_REGISTRY_TOKEN: ${{ secrets.CINATRA_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Mint a GitHub Actions OIDC token — GitHub-signed claims: repository,
+          # repository_owner, repository_visibility, and job_workflow_ref of THIS
+          # blessed reusable workflow — scoped to the marketplace audience, and hand
+          # it to the submit tool as CINATRA_SOURCE_IDENTITY_TOKEN. The marketplace
+          # public-repo predicate verifies it to auto-approve a first-party submit.
+          #
+          # BEST-EFFORT: a mint failure NEVER fails the publish — a missing token
+          # only routes the submission to manual moderation (it is never auto-
+          # rejected). The token is minted AND consumed inside THIS step: it is
+          # never written to GITHUB_OUTPUT / a file / a log, and is masked
+          # defensively before the submit tool runs.
+          if [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && [ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            OIDC_RESP="$(curl -sS \
+              -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://marketplace.cinatra.ai" || true)"
+            CINATRA_SOURCE_IDENTITY_TOKEN="$(printf '%s' "$OIDC_RESP" | node -e 'let s="";process.stdin.on("data",d=>{s+=d});process.stdin.on("end",()=>{try{process.stdout.write(String(JSON.parse(s).value||""))}catch{process.stdout.write("")}})' || true)"
+            OIDC_RESP=""
+            if [ -n "${CINATRA_SOURCE_IDENTITY_TOKEN:-}" ]; then
+              echo "::add-mask::${CINATRA_SOURCE_IDENTITY_TOKEN}"
+              export CINATRA_SOURCE_IDENTITY_TOKEN
+              echo "Minted source-identity OIDC token (aud=https://marketplace.cinatra.ai)."
+            else
+              echo "::warning::source-identity OIDC mint returned no token — submitting without it (manual moderation)."
+            fi
+          else
+            echo "::warning::OIDC token request env unavailable (id-token: write?) — submitting without a source-identity token."
+          fi
+          node .cinatra-release/scripts/v622/templates/release/release-submit.mjs "${{ steps.pack.outputs.tarball }}"

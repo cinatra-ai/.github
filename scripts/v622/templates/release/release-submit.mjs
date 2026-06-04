@@ -248,6 +248,39 @@ export async function assertDependencyOrdering(opts) {
   return report;
 }
 
+// Assemble the exact `cinatra-extension-submit-for-review` MCP arguments. Kept a
+// pure, exported function so the wire shape is unit-testable without pacote/MCP.
+// Optional fields are emitted ONLY when meaningfully present, so a submit with no
+// description and no source-identity token is byte-identical to the historical
+// shape (back-compat with every existing/replayed submission).
+export function buildSubmitArguments({
+  namespace,
+  extensionName,
+  version,
+  artifactDigestSha256,
+  artifactSizeBytes,
+  tarballBase64,
+  description,
+  sourceIdentityToken,
+} = {}) {
+  const args = {
+    namespace,
+    extension_name: extensionName,
+    version,
+    artifact_digest_sha256: artifactDigestSha256,
+    artifact_size_bytes: artifactSizeBytes,
+    tarball_base64: tarballBase64,
+  };
+  if (typeof description === "string" && description !== "") args.description = description;
+  // The GitHub-signed OIDC source-identity token (proves repo/owner/visibility/
+  // workflow). Forwarded ONLY when present; the marketplace owns size/shape
+  // validation (an oversized/invalid token => manual moderation, never a reject).
+  if (typeof sourceIdentityToken === "string" && sourceIdentityToken !== "") {
+    args.source_identity_token = sourceIdentityToken;
+  }
+  return args;
+}
+
 // --- marketplace submit (lazy heavy imports) ---------------------------------
 async function submitTarball({ tarballPath, description, skipDependencyCheck }) {
   const tarballBytes = await readFile(tarballPath);
@@ -280,6 +313,10 @@ async function submitTarball({ tarballPath, description, skipDependencyCheck }) 
 
   const token = process.env.CINATRA_MARKETPLACE_VENDOR_TOKEN;
   if (!token) throw new Error("CINATRA_MARKETPLACE_VENDOR_TOKEN is not set (the submit-scope vendor token).");
+  // GitHub-signed source-identity OIDC token, minted by the reusable release
+  // workflow scoped to the marketplace audience. Optional: present in CI (enables
+  // public-repo auto-approve), absent for manual/local submit (manual moderation).
+  const sourceIdentityToken = process.env.CINATRA_SOURCE_IDENTITY_TOKEN;
   const baseUrl = (process.env.MARKETPLACE_BASE_URL || MARKETPLACE_BASE_URL).replace(/\/+$/, "");
 
   const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
@@ -291,18 +328,25 @@ async function submitTarball({ tarballPath, description, skipDependencyCheck }) 
   try {
     await client.connect(transport);
     process.stderr.write(`Submitting ${manifest.name}@${version} (${artifactSizeBytes} bytes) to the Cinatra Marketplace…\n`);
+    // Observability only — NEVER print the token value.
+    process.stderr.write(
+      sourceIdentityToken
+        ? "ℹ source-identity OIDC token present — eligible for public-repo auto-approve.\n"
+        : "ℹ no source-identity OIDC token (CINATRA_SOURCE_IDENTITY_TOKEN unset) — submission falls to manual moderation.\n",
+    );
     const result = await client.callTool(
       {
         name: "cinatra-extension-submit-for-review",
-        arguments: {
+        arguments: buildSubmitArguments({
           namespace,
-          extension_name: extensionName,
+          extensionName,
           version,
-          artifact_digest_sha256: artifactDigestSha256,
-          artifact_size_bytes: artifactSizeBytes,
-          tarball_base64: tarballBytes.toString("base64"),
-          ...(description ? { description } : {}),
-        },
+          artifactDigestSha256,
+          artifactSizeBytes,
+          tarballBase64: tarballBytes.toString("base64"),
+          description,
+          sourceIdentityToken,
+        }),
       },
       // resultSchema: keep the SDK default (pass undefined, not null).
       undefined,
