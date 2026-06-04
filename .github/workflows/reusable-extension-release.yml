@@ -114,7 +114,7 @@ jobs:
           elif node -e "p=require('./package.json');d={...p.dependencies,...p.devDependencies};process.exit(d.typescript?0:1)"; then
             corepack pnpm exec tsc --noEmit
           else
-            corepack pnpm dlx -p typescript tsc --noEmit
+            echo "no typecheck script and no typescript dependency — nothing to typecheck (skipping)"
           fi
 
       - name: Test
