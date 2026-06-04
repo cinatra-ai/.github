@@ -193,13 +193,15 @@ jobs:
         if: steps.gate.outputs.should_publish == 'true'
         run: |
           set -euo pipefail
-          # Install the submit tool's two public deps INSIDE the .cinatra-release
-          # sparse checkout (which has NO package.json) — never the extension root —
-          # so npm never resolves the extension's peer graph (a UI connector's
-          # react + @cinatra-ai/sdk-* peers crash npm's resolver: ERESOLVE → null).
-          # release-submit.mjs lives under .cinatra-release/, so its ESM `import`
-          # resolves pacote/MCP from .cinatra-release/node_modules (an ancestor).
-          cd .cinatra-release && npm install --no-save --no-package-lock --ignore-scripts pacote@^21 @modelcontextprotocol/sdk@^1.29.0
+          # Stage the submit tool + its two public deps in an ISOLATED temp dir
+          # OUTSIDE the extension repo tree, so npm never walks up to the extension's
+          # package.json / peer graph (a UI connector's react + @cinatra-ai/sdk-*
+          # peers crash npm's resolver: ERESOLVE → "Cannot read properties of null").
+          # The tool is run from here in the submit step; its ESM `import` resolves
+          # pacote/MCP from this dir's node_modules.
+          mkdir -p "$RUNNER_TEMP/cinatra-submit"
+          cp .cinatra-release/scripts/v622/templates/release/release-submit.mjs "$RUNNER_TEMP/cinatra-submit/release-submit.mjs"
+          ( cd "$RUNNER_TEMP/cinatra-submit" && npm install --no-save --no-package-lock --ignore-scripts pacote@^21 @modelcontextprotocol/sdk@^1.29.0 )
 
       - name: Submit through the marketplace proxy (dependency-gated, source-identity-signed)
         if: steps.gate.outputs.should_publish == 'true'
@@ -235,4 +237,4 @@ jobs:
           else
             echo "::warning::OIDC token request env unavailable (id-token: write?) — submitting without a source-identity token."
           fi
-          node .cinatra-release/scripts/v622/templates/release/release-submit.mjs "${{ steps.pack.outputs.tarball }}"
+          node "$RUNNER_TEMP/cinatra-submit/release-submit.mjs" "$PWD/${{ steps.pack.outputs.tarball }}"
