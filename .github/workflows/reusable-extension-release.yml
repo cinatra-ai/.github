@@ -16,6 +16,12 @@
 # attestation → submit the EXACT bytes through the marketplace MCP proxy
 # (extension-submit-for-review), with the dependency-ordering gate enforced
 # locally first. NEVER a direct Verdaccio publish.
+#
+# After a successful submit, a follow-up job decorates the tag's GitHub Release:
+# auto-generated "What's Changed" PR-list notes + the exact packed tarball +
+# SHA256SUMS.txt. It needs the caller to grant `contents: write` (see
+# examples/release.yml) and degrades to a warning — never a failed publish —
+# when the grant is missing. It never creates tags (gh --verify-tag).
 
 name: reusable-extension-release
 
@@ -44,6 +50,10 @@ jobs:
       contents: read
       id-token: write       # OIDC — provenance attestation AND source-identity token mint
       attestations: write   # provenance attestation
+    outputs:
+      should_publish: ${{ steps.gate.outputs.should_publish }}
+      tag: ${{ steps.gate.outputs.tag }}
+      tarball: ${{ steps.pack.outputs.tarball }}
     steps:
       # The extension repo at the release tag.
       - name: Checkout extension repo
@@ -93,6 +103,7 @@ jobs:
             echo "should_publish=true" >> "$GITHUB_OUTPUT"
           fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
       # Install with the committed lockfile when present; extracted repos ship
       # none today, so fall back to a fresh resolve. (Committing a per-repo
@@ -238,3 +249,85 @@ jobs:
             echo "::warning::OIDC token request env unavailable (id-token: write?) — submitting without a source-identity token."
           fi
           node "$RUNNER_TEMP/cinatra-submit/release-submit.mjs" "$PWD/${{ steps.pack.outputs.tarball }}"
+
+      # Hand the EXACT submitted bytes to the github-release job below. Placed
+      # AFTER the submit step on purpose: the Release page never carries an
+      # artifact the marketplace did not receive.
+      - name: Upload tarball for the Release job
+        if: steps.gate.outputs.should_publish == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: npm-pack-tarball
+          path: ${{ steps.pack.outputs.tarball }}
+          if-no-files-found: error
+
+  # Post-submit: give the tag a GitHub Release page that carries the release
+  # contract — auto-generated "What's Changed" PR-list notes plus the exact
+  # packed tarball and a SHA256SUMS.txt — so any tag maps to the set of shipped
+  # PRs and a downloadable, hash-pinnable artifact (GitHub's auto source
+  # zip/tar.gz archives have no checksum-stability guarantee).
+  #
+  # NO `permissions:` block on purpose: a called workflow can only DOWNGRADE the
+  # caller's token grant — requesting `contents: write` here would hard-fail the
+  # entire run for every existing thin caller that still grants
+  # `contents: read`. The job inherits the caller's token instead and degrades
+  # to a loud warning (the 403 handling below) when write is missing, so the
+  # marketplace publish keeps working for not-yet-updated callers. Callers
+  # enable Release decoration with a one-line bump (see examples/release.yml).
+  github-release:
+    needs: release
+    if: needs.release.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download packed tarball
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: npm-pack-tarball
+
+      # Idempotent across both triggers. A `release: published` run means the
+      # Release already exists: keep it, backfill auto-generated notes ONLY when
+      # its body is empty (never overwrite author-written notes), and attach the
+      # assets (--clobber makes re-runs safe). A workflow_dispatch backfill on a
+      # bare tag creates the Release; --verify-tag refuses to invent a tag, so
+      # this workflow NEVER creates tags — owners cut tags, CI only decorates.
+      - name: Create/decorate GitHub Release (PR-list notes, tarball, checksums)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release.outputs.tag }}
+          REPO: ${{ github.repository }}
+          TARBALL: ${{ needs.release.outputs.tarball }}
+        run: |
+          set -euo pipefail
+          sha256sum "$TARBALL" > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+          # Explicit `|| return 1` per write: the function runs in an `if !`
+          # condition context, where bash suppresses `set -e` inside the body —
+          # without them a failed notes backfill would be silently swallowed.
+          # The body check is whitespace-aware (command substitution + strip):
+          # `gh --jq` always emits a trailing newline, so a bytes-on-disk test
+          # would mistake an empty body for an authored one.
+          decorate() {
+            local body
+            if body="$(gh release view "$TAG" --repo "$REPO" --json body --jq '.body // ""' 2>/dev/null)"; then
+              echo "Release $TAG already exists — decorating it."
+              if [ -z "${body//[[:space:]]/}" ]; then
+                echo "Empty release body — backfilling auto-generated PR-list notes."
+                gh api "repos/${REPO}/releases/generate-notes" -f tag_name="$TAG" --jq .body > notes.md || return 1
+                gh release edit "$TAG" --repo "$REPO" --notes-file notes.md || return 1
+              fi
+            else
+              gh release create "$TAG" --repo "$REPO" --title "$TAG" --generate-notes --verify-tag || return 1
+            fi
+            gh release upload "$TAG" --repo "$REPO" --clobber "$TARBALL" SHA256SUMS.txt || return 1
+          }
+
+          if ! decorate 2> err.log; then
+            cat err.log >&2
+            if grep -qiE 'HTTP 403|Resource not accessible' err.log; then
+              echo "::warning::GITHUB_TOKEN lacks 'contents: write' — the marketplace submit succeeded, but the GitHub Release was not created/decorated. Bump the caller's permissions block (contents: read → write, see examples/release.yml) to enable PR-list notes + tarball/checksums attachment."
+              exit 0
+            fi
+            exit 1
+          fi
+          cat err.log >&2 || true

@@ -17,7 +17,7 @@
 #   - wires the `release: published` trigger (the tag==v<version> gate is enforced
 #     inside the reusable workflow — a tag != v<version>, or a pre-release tag, is
 #     skipped, not published),
-#   - grants the provenance-attestation permissions,
+#   - grants the provenance-attestation + Release-decoration permissions,
 #   - inherits the org-level submit secret.
 #
 # Dormant until the org infra exists: the cinatra-ai/.github reusable workflow
@@ -32,7 +32,7 @@ on:
 jobs:
   release:
     permissions:
-      contents: read
+      contents: write       # GitHub Release decoration (PR-list notes + tarball/checksums assets)
       id-token: write       # build-provenance attestation (OIDC)
       attestations: write
     uses: cinatra-ai/.github/.github/workflows/reusable-extension-release.yml@main

@@ -21,7 +21,14 @@ caller invokes the central reusable workflow, which:
    dependency must already be published on `registry.cinatra.ai`),
 6. **submits** the exact bytes through the marketplace MCP publish-proxy by calling
    the `cinatra-extension-submit-for-review` tool at
-   `https://marketplace.cinatra.ai/wp-json/cinatra/mcp`.
+   `https://marketplace.cinatra.ai/wp-json/cinatra/mcp`,
+7. after a successful submit, **decorates the tag's GitHub Release**: auto-generated
+   "What's Changed" PR-list notes (backfilled only when the release body is empty —
+   author-written notes are never overwritten; a `workflow_dispatch` backfill on a
+   bare tag creates the Release with `--verify-tag`, never the tag itself) and
+   attaches the **exact packed tarball + `SHA256SUMS.txt`**. Requires the caller to
+   grant `contents: write` (see [`release.yml`](./release.yml)); with only
+   `contents: read` the submit still succeeds and this step degrades to a warning.
 
 Approval (human moderator, or trusted-vendor auto-approve once it ships) and the
 promotion saga to `registry.cinatra.ai` happen **on the marketplace side** — CI
@@ -69,6 +76,8 @@ stable version can never publish from the default branch.
   `npm publish` / `pnpm publish` and never writes to `registry.cinatra.ai`
   (Verdaccio) directly.
 - **No repo mutation.** It never deletes, archives, renames, or force-pushes any
-  repository — it reads the extension at the tag and submits a tarball.
+  repository — it reads the extension at the tag and submits a tarball. The only
+  write is additive Release decoration on the already-cut tag (notes + assets);
+  it **never creates tags** (`--verify-tag` fails closed on a missing tag).
 - **No self-approve.** The CI token is submit-scope; approval is a separate,
   trusted authority (human moderator or trusted-vendor policy).
