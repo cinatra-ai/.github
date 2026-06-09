@@ -57,9 +57,9 @@ jobs:
     steps:
       # The extension repo at the release tag.
       - name: Checkout extension repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: ${{ inputs.node-version }}
       - name: Enable corepack
@@ -175,14 +175,14 @@ jobs:
       # later step; generating it now means the artifact is attestable on day one.
       - name: Attest build provenance
         if: steps.gate.outputs.should_publish == 'true'
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: ${{ steps.pack.outputs.tarball }}
 
       # Fetch the shared, self-contained submit tool from the org .github repo.
       - name: Checkout submit tool
         if: steps.gate.outputs.should_publish == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           repository: cinatra-ai/.github
           ref: ${{ inputs.github-repo-ref }}
