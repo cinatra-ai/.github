@@ -1,0 +1,14 @@
+# Dependencies (release-submit installs pacote + MCP SDK at runtime when run locally)
+node_modules/
+
+# Environment / secrets
+.env
+.env.*
+
+# Logs
+*.log
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
