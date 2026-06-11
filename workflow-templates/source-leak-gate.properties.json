@@ -1,0 +1,4 @@
+{
+    "name": "source-leak-gate (cinatra-ai required check)",
+    "description": "Org-standard thin caller for the source-leak gate in cinatra-ai/ci, double-pinned to a tagged release SHA. The org ruleset baseline-protection requires the context 'source-leak-gate / source-leak-gate' on every default branch, so every new repo needs this workflow seeded."
+}

@@ -1,0 +1,15 @@
+name: actions-pinned-gate
+
+on:
+  pull_request:
+  push:
+    branches: [$default-branch]
+
+permissions:
+  contents: read
+
+jobs:
+  actions-pinned-gate:
+    uses: cinatra-ai/ci/.github/workflows/actions-pinned-gate.yml@ee01071f703412c4aa6e6b2fb16b089cb8bbeac0 # v0.1.0
+    with:
+      ref: ee01071f703412c4aa6e6b2fb16b089cb8bbeac0

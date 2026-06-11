@@ -1,0 +1,17 @@
+name: source-leak-gate
+
+on:
+  pull_request:
+  push:
+    branches: [$default-branch]
+
+permissions:
+  contents: read
+
+jobs:
+  source-leak-gate:
+    uses: cinatra-ai/ci/.github/workflows/source-leak-gate.yml@ee01071f703412c4aa6e6b2fb16b089cb8bbeac0 # v0.1.0
+    with:
+      profile: default
+      ratchet_mode: line
+      ref: ee01071f703412c4aa6e6b2fb16b089cb8bbeac0
