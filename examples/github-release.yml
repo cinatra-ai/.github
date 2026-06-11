@@ -43,6 +43,10 @@ permissions:
 
 jobs:
   github-release:
-    uses: cinatra-ai/.github/.github/workflows/reusable-release-notes.yml@main # pin to a 40-char SHA + `# v0.0.0-main.<short-sha>` comment in production
+    # PIN-ME: replace the all-zeros placeholder with a real 40-char commit SHA
+    # of cinatra-ai/.github main and update the comment to v0.0.0-main.<short-sha>.
+    # Copied verbatim, the placeholder FAILS CLOSED (ref not found) instead of
+    # silently tracking a mutable branch.
+    uses: cinatra-ai/.github/.github/workflows/reusable-release-notes.yml@0000000000000000000000000000000000000000 # v0.0.0-main.PIN-ME
     with:
       tag: ${{ inputs.tag }}

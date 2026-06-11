@@ -120,10 +120,16 @@ jobs:
           # semver precedence (prerelease suffixes sort after the release), which
           # is acceptable for a notes start point. Empty (first release) lets
           # GitHub fall back to its default full-changelog behavior.
+          # Decorate-sort-undecorate: map the first `-` (prerelease separator)
+          # to `~`, which GNU `sort -V` orders BEFORE end-of-string — giving
+          # correct semver precedence (v1.2.0-rc.1 < v1.2.0), then walk the
+          # sorted list to the entry just before $TAG.
           prev=$({ git tag --merged "${TAG}^{commit}" \
               | grep -E '^v[0-9]+\.[0-9]+(\.[0-9]+)?([.+-][0-9A-Za-z.-]+)?$' \
               | grep -Fxv "$TAG" || true; echo "$TAG"; } \
-            | sort -V | awk -v t="$TAG" '$0==t{print p; exit} {p=$0}')
+            | awk '{ s=$0; sub(/-/,"~",s); print s "\t" $0 }' \
+            | sort -V | cut -f2 \
+            | awk -v t="$TAG" '$0==t{print p; exit} {p=$0}')
           echo "prev=${prev}" >>"$GITHUB_OUTPUT"
           echo "==> previous semver tag: ${prev:-<none — first release>}"
 
@@ -143,7 +149,19 @@ jobs:
         run: |
           set -euo pipefail
 
-          backfill_notes() {
+          # Backfill ONLY when the body is empty/whitespace — the same check on
+          # every path, so even a create race can never overwrite notes a human
+          # wrote concurrently. The notes are generated FIRST and the body is
+          # re-read immediately before the edit, shrinking the unavoidable
+          # check-then-write window (the releases API has no compare-and-swap)
+          # to the single view→edit hop.
+          backfill_if_empty() {
+            local body
+            body="$(gh release view "$TAG" --repo "$REPO" --json body --jq '.body // ""' 2>/dev/null)" || return 1
+            if [ -n "${body//[[:space:]]/}" ]; then
+              echo "::notice::Release $TAG already has notes — left untouched (author-written notes are never overwritten)."
+              return 0
+            fi
             # `gh release edit` has no --generate-notes: generate via REST,
             # then edit. previous_tag_name pins the PR-list range when a
             # previous semver tag exists.
@@ -152,21 +170,15 @@ jobs:
               args+=(-f previous_tag_name="$PREV")
             fi
             gh api "repos/${REPO}/releases/generate-notes" "${args[@]}" --jq .body > notes.md || return 1
-            gh release edit "$TAG" --repo "$REPO" --notes-file notes.md || return 1
-          }
-
-          # Backfill ONLY when the body is empty/whitespace — the same check on
-          # every path, so even a create race can never overwrite notes a human
-          # wrote concurrently.
-          backfill_if_empty() {
-            local body
+            # Re-check just before writing: a human may have written notes
+            # while the generate call ran.
             body="$(gh release view "$TAG" --repo "$REPO" --json body --jq '.body // ""' 2>/dev/null)" || return 1
-            if [ -z "${body//[[:space:]]/}" ]; then
-              echo "Release $TAG exists with an empty body — backfilling auto-generated PR-list notes."
-              backfill_notes || return 1
-            else
-              echo "::notice::Release $TAG already has notes — left untouched (author-written notes are never overwritten)."
+            if [ -n "${body//[[:space:]]/}" ]; then
+              echo "::notice::Release $TAG gained notes while generating — left untouched."
+              return 0
             fi
+            echo "Release $TAG has an empty body — backfilling auto-generated PR-list notes."
+            gh release edit "$TAG" --repo "$REPO" --notes-file notes.md || return 1
           }
 
           decorate() {
