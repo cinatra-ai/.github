@@ -1,0 +1,4 @@
+{
+    "name": "actions-pinned-gate (cinatra-ai required check)",
+    "description": "Org-standard thin caller for the actions-pinned gate in cinatra-ai/ci, double-pinned to a tagged release SHA. Fails CI if any remote 'uses:' ref in .github/workflows or .github/actions is not pinned to a 40-char commit SHA with a version comment. Required as 'actions-pinned-gate / actions-pinned-gate' by the org ruleset baseline-protection."
+}

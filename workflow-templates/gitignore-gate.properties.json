@@ -1,0 +1,4 @@
+{
+    "name": "gitignore-gate (cinatra-ai required check)",
+    "description": "Org-standard thin caller for the gitignore gate in cinatra-ai/ci, double-pinned to a tagged release SHA. Enforces that the repo .gitignore carries the org-baseline entries. Required as 'gitignore-gate / gitignore-gate' by the org ruleset baseline-protection."
+}
