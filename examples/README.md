@@ -16,13 +16,20 @@ caller invokes the central reusable workflow, which:
    (any version containing a `-`),
 3. installs (`--frozen-lockfile` if a `pnpm-lock.yaml` is committed, else a fresh
    resolve), then runs `typecheck` / `test` / the per-kind `extension-kind-gate.mjs`,
-4. `npm pack`s the exact bytes and attests **build provenance** for that tarball,
-5. runs the existence-based **dependency-ordering gate** (every `@cinatra-ai/*`
+4. runs the **packlist leak gate**: the release **fails** if `npm pack --dry-run
+   --json` lists any non-distributable path — `.github/`, `.planning`, `.env*`
+   (except `.env.example`), key material, tests/fixtures, or CI/build/lint
+   tooling config (`tsconfig*.json`, bundler/test-runner configs, …). npm's
+   force-included root `package.json` / `README*` / `LICENSE*` never flag; the
+   fix in a flagged repo is a package.json `files` **allowlist**
+   (cinatra-engineering#56),
+5. `npm pack`s the exact bytes and attests **build provenance** for that tarball,
+6. runs the existence-based **dependency-ordering gate** (every `@cinatra-ai/*`
    dependency must already be published on `registry.cinatra.ai`),
-6. **submits** the exact bytes through the marketplace MCP publish-proxy by calling
+7. **submits** the exact bytes through the marketplace MCP publish-proxy by calling
    the `cinatra-extension-submit-for-review` tool at
    `https://marketplace.cinatra.ai/wp-json/cinatra/mcp`,
-7. after a successful submit, **decorates the tag's GitHub Release**: auto-generated
+8. after a successful submit, **decorates the tag's GitHub Release**: auto-generated
    "What's Changed" PR-list notes (backfilled only when the release body is empty —
    author-written notes are never overwritten; a `workflow_dispatch` backfill on a
    bare tag creates the Release with `--verify-tag`, never the tag itself) and
