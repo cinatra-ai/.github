@@ -122,8 +122,9 @@ jobs:
           # GitHub fall back to its default full-changelog behavior.
           # Decorate-sort-undecorate: map the first `-` (prerelease separator)
           # to `~`, which GNU `sort -V` orders BEFORE end-of-string — giving
-          # correct semver precedence (v1.2.0-rc.1 < v1.2.0), then walk the
-          # sorted list to the entry just before $TAG.
+          # correct semver precedence (an rc/beta prerelease sorts before the
+          # release it precedes), then walk the sorted list to the entry just
+          # before $TAG.
           prev=$({ git tag --merged "${TAG}^{commit}" \
               | grep -E '^v[0-9]+\.[0-9]+(\.[0-9]+)?([.+-][0-9A-Za-z.-]+)?$' \
               | grep -Fxv "$TAG" || true; echo "$TAG"; } \
