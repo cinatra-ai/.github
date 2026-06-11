@@ -54,7 +54,7 @@ policy, update the pins here as part of the same rollout.
 
 This pipeline is dormant until:
 1. `CINATRA_MARKETPLACE_VENDOR_TOKEN` is set as an org secret (submit scope), scoped to the extension repos.
-2. The extension repos exist and carry the thin `release: published` caller (shipped by the v6.22 extractor).
+2. The extension repos exist and carry the thin `release: published` caller (shipped by the extension-repo extractor).
 3. `registry.cinatra.ai` is reachable for the dependency-ordering gate (`CINATRA_REGISTRY_TOKEN` read scope,
    or the public-read posture).
 

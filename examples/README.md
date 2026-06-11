@@ -45,7 +45,7 @@ never publishes to Verdaccio.
 
 Copy [`release.yml`](./release.yml) into your extension repo at
 `.github/workflows/release.yml`. It is `uses: cinatra-ai/.github/.github/workflows/reusable-extension-release.yml@main`
-with `secrets: inherit`. (The v6.22 extractor already ships an identical caller
+with `secrets: inherit`. (The extension-repo extractor already ships an identical caller
 into every extracted repo — copy this only when hand-wiring or auditing.)
 
 ## Step 2 — set the org secret (owner / org-admin)
