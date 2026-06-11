@@ -1,0 +1,20 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "cinatra-ai org-wide Renovate defaults. Repos extend this as local>cinatra-ai/.github:renovate-config.",
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "timezone": "Europe/Berlin",
+  "schedule": ["before 6am on monday"],
+  "automerge": false,
+  "dependencyDashboard": true,
+  "packageRules": [
+    {
+      "description": "cinatra-ai/ci reusable-workflow callers are double-pinned (uses:@<sha> plus a with.ref input set to the same SHA). Renovate only rewrites the uses: half, so an automated update would silently diverge the two pins. Internal ci pins are bumped by coordinated org rollout waves instead.",
+      "matchManagers": ["github-actions"],
+      "matchPackageNames": ["cinatra-ai/ci"],
+      "enabled": false
+    }
+  ]
+}
