@@ -6,9 +6,11 @@ Org-shared GitHub configuration for the Cinatra extension marketplace publish pi
 
 - **`.github/workflows/reusable-extension-release.yml`** — the central `workflow_call` reusable
   workflow that each extracted extension repo invokes from a thin `release: published` caller. It
-  builds the extension from a clean checkout, runs the per-kind gate, `npm pack`s, attests build
-  provenance, runs the dependency-ordering gate, and submits the exact bytes through the marketplace
-  MCP publish-proxy (`extension-submit-for-review`) — never a direct Verdaccio publish.
+  builds the extension from a clean checkout, runs the per-kind gate, runs the packlist leak gate
+  (fails the release if `npm pack --dry-run --json` lists `.github/`, `.planning`, `.env*`, tests,
+  or CI/tooling config — cinatra-engineering#56), `npm pack`s, attests build provenance, runs the
+  dependency-ordering gate, and submits the exact bytes through the marketplace MCP publish-proxy
+  (`extension-submit-for-review`) — never a direct Verdaccio publish.
 - **`scripts/v622/templates/release/release-submit.mjs`** — the self-contained, portable submit CLI
   the reusable workflow (and manual/local backfill) uses. Needs only `pacote` + `@modelcontextprotocol/sdk`.
 

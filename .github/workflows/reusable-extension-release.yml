@@ -12,10 +12,13 @@
 #   - CINATRA_MARKETPLACE_VENDOR_TOKEN is set as a GitHub org secret (submit scope)
 #   - registry.cinatra.ai public-read is enabled (or CINATRA_REGISTRY_TOKEN is set)
 #
-# Flow: build the CI artifact from a clean checkout → npm pack → provenance
-# attestation → submit the EXACT bytes through the marketplace MCP proxy
-# (extension-submit-for-review), with the dependency-ordering gate enforced
-# locally first. NEVER a direct Verdaccio publish.
+# Flow: build the CI artifact from a clean checkout → packlist leak gate
+# (`npm pack --dry-run --json` must list no internal path: `.github/`,
+# `.planning`, env files, tests, CI/tooling config — cinatra-engineering#56)
+# → npm pack → provenance attestation → submit the EXACT bytes through the
+# marketplace MCP proxy (extension-submit-for-review), with the
+# dependency-ordering gate enforced locally first. NEVER a direct Verdaccio
+# publish.
 #
 # After a successful submit, a follow-up job decorates the tag's GitHub Release:
 # auto-generated "What's Changed" PR-list notes + the exact packed tarball +
@@ -160,6 +163,128 @@ jobs:
           else
             echo "no extension-kind-gate.mjs (connector/artifact/skill) — skipping"
           fi
+
+      # Packlist leak gate (cinatra-engineering#56). The npm tarball is the
+      # DISTRIBUTION artifact crossing a trust boundary (publish-proxy →
+      # registry → installer): the release FAILS here if `npm pack --dry-run
+      # --json` would ship any non-distributable path — `.github/` (workflows
+      # leak pipeline structure, runner labels, secret names, proxy/registry
+      # endpoints), `.planning`, env files, key material, tests/fixtures, or
+      # CI/build/lint tooling config. The fix in a flagged repo is a
+      # package.json `files` ALLOWLIST (fails closed for new files), not an
+      # `.npmignore` denylist. npm force-includes root `package.json` /
+      # `README*` / `LICENSE*` regardless of `files` — those never flag.
+      # `.env.example` is tolerated as documentation (the epic's per-repo
+      # carve-out); every other `.env*` fails. The checker is INLINE on
+      # purpose: a caller's SHA pin of this workflow then pins the gate's
+      # rules too (no mutable side-fetch). Fail-closed: an unparsable or
+      # empty pack listing also fails the release.
+      - name: Packlist gate (no internal paths in the publish tarball)
+        if: steps.gate.outputs.should_publish == 'true'
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/packlist-gate.mjs" <<'PACKLIST_GATE_EOF'
+          import { readFileSync } from 'node:fs';
+
+          // npm force-includes these at the package root no matter what
+          // `files` / `.npmignore` say — never flag them.
+          const FORCE_INCLUDED = /^(package\.json|README(\.[^/]+)?|LICEN[CS]E(\.[^/]+)?)$/i;
+
+          // Directory/segment names that must never ship, at any depth.
+          const DENY_SEGMENTS = new Set([
+            '.github', '.planning', '.circleci', '.devcontainer', '.husky',
+            '.vscode', '.idea', '__tests__', '__fixtures__', '__snapshots__',
+            'tests', 'coverage',
+          ]);
+
+          // Internal/release script dirs — top-level only (a nested
+          // `src/scripts/` may be runtime code; top-level `scripts/`/`tools/`
+          // in this org is release/ops tooling).
+          const DENY_TOP_DIRS = new Set(['scripts', 'tools']);
+
+          // [regex on basename, reason, optional exemption on basename]
+          const DENY_BASENAMES = [
+            [/^\.env/i, 'env file — npm does NOT auto-ignore these', (b) => b.toLowerCase() === '.env.example'],
+            [/\.(pem|key)$/i, 'key material'],
+            [/\.(test|spec)\./i, 'test file'],
+            [/^tsconfig.*\.json$/i, 'TypeScript build config'],
+            [/^(vitest|jest|babel|rollup|webpack|vite|tsup|esbuild)\.config\./i, 'test-runner/bundler config'],
+            [/^\.babelrc(\..+)?$/i, 'transpiler config'],
+            [/^\.eslintrc(\..+)?$/i, 'lint config'],
+            [/^eslint\.config\./i, 'lint config'],
+            [/^\.prettierrc(\..+)?$/i, 'format config'],
+            [/^prettier\.config\./i, 'format config'],
+            [/^\.editorconfig$/i, 'editor config'],
+            [/^\.nvmrc$/i, 'node version pin'],
+            [/^(.+\.)?dockerfile$/i, 'Docker build file'],
+            [/^\.dockerignore$/i, 'Docker config'],
+            [/^\.gitattributes$/i, 'git plumbing (npm does NOT strip it)'],
+            [/^\.gitlab-ci\.ya?ml$/i, 'CI config'],
+            [/^jenkinsfile$/i, 'CI config'],
+            [/^azure-pipelines\.ya?ml$/i, 'CI config'],
+            [/^\.travis\.ya?ml$/i, 'CI config'],
+            [/^renovate\.json5?$/i, 'CI config'],
+            [/^\.pre-commit-config\.ya?ml$/i, 'CI config'],
+            [/^dependabot\.ya?ml$/i, 'CI config'],
+            [/^codeowners$/i, 'CODEOWNERS'],
+          ];
+
+          let parsed;
+          try {
+            parsed = JSON.parse(readFileSync(process.argv[2], 'utf8'));
+          } catch (e) {
+            console.error(`::error::packlist gate: cannot parse \`npm pack --dry-run --json\` output (${e.message}) — failing closed`);
+            process.exit(1);
+          }
+          const entry = Array.isArray(parsed) ? parsed[0] : parsed;
+          const files = entry && Array.isArray(entry.files) ? entry.files : null;
+          if (!files || files.length === 0) {
+            console.error('::error::packlist gate: pack listing has no files — failing closed');
+            process.exit(1);
+          }
+
+          const violations = [];
+          for (const f of files) {
+            if (!f || typeof f.path !== 'string' || f.path.length === 0) {
+              violations.push([JSON.stringify(f && f.path), 'malformed pack listing entry — failing closed']);
+              continue;
+            }
+            const path = f.path.replace(/^\.\//, '');
+            if (path.split('/').includes('..')) {
+              violations.push([path, 'path traversal in pack listing']);
+              continue;
+            }
+            if (FORCE_INCLUDED.test(path)) continue; // root-level only: no '/' can match
+            const segments = path.split('/');
+            const basename = segments[segments.length - 1];
+            const denySegment = segments.find((s) => DENY_SEGMENTS.has(s.toLowerCase()));
+            if (denySegment) {
+              violations.push([path, `'${denySegment}/' content must not ship`]);
+              continue;
+            }
+            if (segments.length > 1 && DENY_TOP_DIRS.has(segments[0].toLowerCase())) {
+              violations.push([path, `top-level '${segments[0]}/' is internal tooling`]);
+              continue;
+            }
+            for (const [re, reason, exempt] of DENY_BASENAMES) {
+              if (re.test(basename) && !(exempt && exempt(basename))) {
+                violations.push([path, reason]);
+                break;
+              }
+            }
+          }
+
+          if (violations.length > 0) {
+            for (const [path, reason] of violations) {
+              console.error(`::error::packlist gate: tarball would ship '${path}' (${reason})`);
+            }
+            console.error(`::error::packlist gate: ${violations.length} disallowed path(s) in the npm pack listing — add a package.json "files" allowlist (cinatra-engineering#56). Refusing to publish.`);
+            process.exit(1);
+          }
+          console.log(`packlist gate OK — ${files.length} file(s), no disallowed paths.`);
+          PACKLIST_GATE_EOF
+          npm pack --dry-run --json --silent > "$RUNNER_TEMP/npm-packlist.json"
+          node "$RUNNER_TEMP/packlist-gate.mjs" "$RUNNER_TEMP/npm-packlist.json"
 
       - name: Pack
         id: pack
