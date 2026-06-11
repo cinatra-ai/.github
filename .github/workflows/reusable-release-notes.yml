@@ -155,15 +155,23 @@ jobs:
             gh release edit "$TAG" --repo "$REPO" --notes-file notes.md || return 1
           }
 
-          decorate() {
+          # Backfill ONLY when the body is empty/whitespace — the same check on
+          # every path, so even a create race can never overwrite notes a human
+          # wrote concurrently.
+          backfill_if_empty() {
             local body
-            if body="$(gh release view "$TAG" --repo "$REPO" --json body --jq '.body // ""' 2>/dev/null)"; then
-              if [ -z "${body//[[:space:]]/}" ]; then
-                echo "Release $TAG exists with an empty body — backfilling auto-generated PR-list notes."
-                backfill_notes || return 1
-              else
-                echo "::notice::Release $TAG already has notes — left untouched (author-written notes are never overwritten)."
-              fi
+            body="$(gh release view "$TAG" --repo "$REPO" --json body --jq '.body // ""' 2>/dev/null)" || return 1
+            if [ -z "${body//[[:space:]]/}" ]; then
+              echo "Release $TAG exists with an empty body — backfilling auto-generated PR-list notes."
+              backfill_notes || return 1
+            else
+              echo "::notice::Release $TAG already has notes — left untouched (author-written notes are never overwritten)."
+            fi
+          }
+
+          decorate() {
+            if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+              backfill_if_empty || return 1
               return 0
             fi
             local create_args=(--repo "$REPO" --title "$TAG" --generate-notes --verify-tag)
@@ -174,10 +182,11 @@ jobs:
               return 0
             fi
             # Create race (re-run / double event): if the Release appeared
-            # concurrently, decorate it instead; otherwise a real failure.
+            # concurrently, fall back to the decorate path — which re-checks
+            # body emptiness; otherwise a real failure.
             if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
-              echo "::notice::Release $TAG appeared concurrently — backfilling instead."
-              backfill_notes || return 1
+              echo "::notice::Release $TAG appeared concurrently — decorating it instead."
+              backfill_if_empty || return 1
               return 0
             fi
             return 1
