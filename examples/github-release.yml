@@ -1,0 +1,52 @@
+# ── COPY ME ──────────────────────────────────────────────────────────────────
+# Per-repo caller for GitHub Release decoration in NON-extension repos
+# (plain repos, PHP/deploy repos — anything that cuts v* tags but does not
+# publish an npm package through reusable-extension-release.yml; extension
+# repos use examples/release.yml instead, which already decorates Releases).
+#
+# Drop this file into the repo at:
+#     .github/workflows/github-release.yml
+#
+# On a pushed annotated semver `v*` tag this creates (or backfills, if the
+# Release exists with an empty body) the tag's GitHub Release page with
+# auto-generated "What's Changed" PR-list notes — so any tag maps to the exact
+# set of shipped PRs. GitHub auto-exposes `Source code (zip/tar.gz)` on every
+# Release; the repo's root `.gitattributes` `export-ignore` rules govern what
+# those archives contain.
+#
+# Gates enforced inside the reusable workflow (no per-repo logic here):
+#   - non-semver `v*` tags (checkpoints/markers) are a NO-OP,
+#   - lightweight tags FAIL (the org contract requires `git tag -a`),
+#   - tags are never created (`--verify-tag`), authored notes never overwritten.
+#
+# The `workflow_dispatch` path backfills an EXISTING tag (old tags don't
+# contain this workflow file, so backfills run from the default branch and
+# pass the tag explicitly). Backfilling historical tags is an owner decision —
+# don't bulk-create Release pages without one.
+#
+# No secrets are needed (GITHUB_TOKEN only) — do NOT add `secrets: inherit`.
+# Pin the `uses:` ref to a commit SHA of cinatra-ai/.github (org pin policy).
+name: github-release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing v* tag to decorate (backfill). This never creates tags."
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  github-release:
+    # PIN-ME: replace the all-zeros placeholder with a real 40-char commit SHA
+    # of cinatra-ai/.github main and update the comment to v0.0.0-main.<short-sha>.
+    # Copied verbatim, the placeholder FAILS CLOSED (ref not found) instead of
+    # silently tracking a mutable branch.
+    uses: cinatra-ai/.github/.github/workflows/reusable-release-notes.yml@0000000000000000000000000000000000000000 # v0.0.0-main.PIN-ME
+    with:
+      tag: ${{ inputs.tag }}
