@@ -1,0 +1,190 @@
+# Reusable GitHub Release decoration for NON-extension cinatra-ai repos
+# ("plain" repos, PHP/deploy repos — any repo that cuts v* tags but does not
+# publish an npm package through reusable-extension-release.yml).
+#
+# One job: given a tag (pushed, or passed in for a backfill), make sure the
+# tag's GitHub Release page exists and carries auto-generated "What's Changed"
+# PR-list notes — so any tag maps to the exact set of shipped PRs. GitHub
+# auto-exposes `Source code (zip/tar.gz)` on every Release; a repo's root
+# `.gitattributes` `export-ignore` rules govern what those archives contain.
+# No other artifacts are attached (plain repos have no build artifact to ship;
+# extension repos get tarball + checksums from reusable-extension-release.yml).
+#
+# Contract (mirrors cinatra core's create-release job + the marketplace
+# release pipeline's gates):
+#   - SEMVER tags only — the EXACT regex below is shared with cinatra core's
+#     create-release job and marketplace's semver gate. A non-semver `v*` tag
+#     (checkpoint/marker) is a NO-OP, not a failure.
+#   - ANNOTATED tags only — a lightweight `v*` semver tag FAILS the run (the
+#     org release contract requires `git tag -a`; same rule the marketplace
+#     deploy pipeline enforces).
+#   - This workflow NEVER creates tags (`--verify-tag` fails closed on a
+#     missing tag) and NEVER overwrites author-written release notes: an
+#     existing Release body is backfilled only when empty/whitespace.
+#   - Idempotent + race-safe: re-runs no-op on an already-decorated Release;
+#     a create race falls back to the decorate path.
+#
+# Caller contract: trigger on `push: tags: ["v*"]` (plus an optional
+# `workflow_dispatch` with a `tag` input for backfilling existing tags — old
+# tags don't contain this workflow file, so backfills run from the default
+# branch and pass the tag explicitly). The caller MUST grant
+# `contents: write`; with less, the run fails at plan time. No secrets are
+# needed (GITHUB_TOKEN only) — do NOT pass `secrets: inherit`.
+# See examples/github-release.yml for a copy-me caller.
+
+name: reusable-release-notes
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: >-
+          Existing tag to decorate (backfill path). Leave empty on tag-push
+          triggers — the pushed tag is used.
+        type: string
+        required: false
+        default: ""
+
+jobs:
+  release-notes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write   # create/edit the Release (callers must grant this)
+    concurrency:
+      group: release-notes-${{ github.repository }}-${{ inputs.tag || github.ref_name }}
+      cancel-in-progress: false
+    steps:
+      - name: Resolve + semver-gate the tag
+        id: gate
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_TAG}" ]; then
+            tag="${INPUT_TAG}"
+          elif [[ "${REF}" == refs/tags/* ]]; then
+            tag="${REF_NAME}"
+          else
+            echo "FAIL: not a tag push and no 'tag' input. Trigger this workflow from a v* tag push, or dispatch it with the tag to decorate." >&2
+            exit 1
+          fi
+          echo "tag=${tag}" >>"$GITHUB_OUTPUT"
+          # EXACT regex shared with cinatra core's create-release job and the
+          # marketplace release pipeline. Non-semver v* tags are markers — no-op.
+          if [[ "$tag" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?([.+-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "should_run=true" >>"$GITHUB_OUTPUT"
+            echo "::notice::'$tag' is a semver release tag — Release decoration will run."
+          else
+            echo "should_run=false" >>"$GITHUB_OUTPUT"
+            echo "::notice::'$tag' is NOT a semver tag (checkpoint/marker) — no-op."
+          fi
+
+      - name: Checkout (full history + tags)
+        if: steps.gate.outputs.should_run == 'true'
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+
+      - name: Verify tag is annotated + compute previous semver tag
+        if: steps.gate.outputs.should_run == 'true'
+        id: tagmeta
+        env:
+          TAG: ${{ steps.gate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Annotated-tag check: an annotated tag is a `tag` object; a
+          # lightweight tag resolves to a `commit`. The org release contract
+          # requires annotated tags (immutable intent + tagger/date metadata)
+          # — same fail-closed rule as the marketplace deploy pipeline.
+          obj_type=$(git cat-file -t "$TAG" 2>/dev/null || echo "missing")
+          case "$obj_type" in
+            tag)
+              echo "::notice::'$TAG' is an annotated tag." ;;
+            commit)
+              echo "FAIL: '$TAG' is a LIGHTWEIGHT tag — releases must be annotated (git tag -a). Refusing to decorate." >&2
+              exit 1 ;;
+            *)
+              echo "FAIL: tag '$TAG' not found in this repository." >&2
+              exit 1 ;;
+          esac
+          # Previous semver tag REACHABLE from the tagged commit, as an explicit
+          # generate-notes start point. Without it, repos whose older tags never
+          # had Releases can get a wrong/noisy auto-detected range. "Previous" =
+          # the highest reachable semver tag strictly BELOW $TAG in version-sort
+          # order (sorting the candidates together with $TAG and taking the
+          # entry just before it — NOT simply the highest other tag, which could
+          # sit above a backported/lower $TAG). `sort -V` is an approximation of
+          # semver precedence (prerelease suffixes sort after the release), which
+          # is acceptable for a notes start point. Empty (first release) lets
+          # GitHub fall back to its default full-changelog behavior.
+          prev=$({ git tag --merged "${TAG}^{commit}" \
+              | grep -E '^v[0-9]+\.[0-9]+(\.[0-9]+)?([.+-][0-9A-Za-z.-]+)?$' \
+              | grep -Fxv "$TAG" || true; echo "$TAG"; } \
+            | sort -V | awk -v t="$TAG" '$0==t{print p; exit} {p=$0}')
+          echo "prev=${prev}" >>"$GITHUB_OUTPUT"
+          echo "==> previous semver tag: ${prev:-<none — first release>}"
+
+      # Idempotent + race-safe. Explicit `|| return 1` per write: the
+      # functions run in an `if !` condition context, where bash suppresses
+      # `set -e` inside the body — without them a failed notes backfill would
+      # be silently swallowed. The body check is whitespace-aware: `gh --jq`
+      # always emits a trailing newline, so a bytes-on-disk test would mistake
+      # an empty body for an authored one.
+      - name: Create or backfill the GitHub Release (PR-list notes)
+        if: steps.gate.outputs.should_run == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.gate.outputs.tag }}
+          PREV: ${{ steps.tagmeta.outputs.prev }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          backfill_notes() {
+            # `gh release edit` has no --generate-notes: generate via REST,
+            # then edit. previous_tag_name pins the PR-list range when a
+            # previous semver tag exists.
+            local args=(-f tag_name="$TAG")
+            if [ -n "$PREV" ]; then
+              args+=(-f previous_tag_name="$PREV")
+            fi
+            gh api "repos/${REPO}/releases/generate-notes" "${args[@]}" --jq .body > notes.md || return 1
+            gh release edit "$TAG" --repo "$REPO" --notes-file notes.md || return 1
+          }
+
+          decorate() {
+            local body
+            if body="$(gh release view "$TAG" --repo "$REPO" --json body --jq '.body // ""' 2>/dev/null)"; then
+              if [ -z "${body//[[:space:]]/}" ]; then
+                echo "Release $TAG exists with an empty body — backfilling auto-generated PR-list notes."
+                backfill_notes || return 1
+              else
+                echo "::notice::Release $TAG already has notes — left untouched (author-written notes are never overwritten)."
+              fi
+              return 0
+            fi
+            local create_args=(--repo "$REPO" --title "$TAG" --generate-notes --verify-tag)
+            if [ -n "$PREV" ]; then
+              create_args+=(--notes-start-tag "$PREV")
+            fi
+            if gh release create "$TAG" "${create_args[@]}"; then
+              return 0
+            fi
+            # Create race (re-run / double event): if the Release appeared
+            # concurrently, decorate it instead; otherwise a real failure.
+            if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+              echo "::notice::Release $TAG appeared concurrently — backfilling instead."
+              backfill_notes || return 1
+              return 0
+            fi
+            return 1
+          }
+
+          if ! decorate; then
+            echo "FAIL: could not create/decorate the GitHub Release for $TAG." >&2
+            echo "If the error above is HTTP 403 / 'Resource not accessible', the caller must grant 'contents: write' (see examples/github-release.yml)." >&2
+            exit 1
+          fi

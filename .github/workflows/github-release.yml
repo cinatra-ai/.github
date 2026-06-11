@@ -1,0 +1,32 @@
+# Thin caller: decorate this repo's own v* tags with a GitHub Release +
+# auto-generated "What's Changed" PR-list notes (this repo's tags are the
+# version pointers for the org reusable workflows — e.g. the packlist-gate
+# pointer v0.1.0 — and deserve the same tag → shipped-PRs traceability as any
+# release). All logic lives in reusable-release-notes.yml; this file only
+# wires the triggers and grants `contents: write`.
+#
+# Owners cut tags; CI only decorates them — the reusable workflow refuses to
+# create a tag (`--verify-tag`) and never overwrites authored notes.
+name: github-release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing v* tag to decorate (backfill). This never creates tags."
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  github-release:
+    # Local-path call (this repo hosts the reusable): ref-locked to the
+    # triggering commit, so it is exempt from the remote SHA-pin rule. Every
+    # OTHER repo pins cinatra-ai/.github/.github/workflows/reusable-release-notes.yml@<sha>.
+    uses: ./.github/workflows/reusable-release-notes.yml
+    with:
+      tag: ${{ inputs.tag }}

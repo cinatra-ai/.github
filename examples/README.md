@@ -88,3 +88,24 @@ stable version can never publish from the default branch.
   it **never creates tags** (`--verify-tag` fails closed on a missing tag).
 - **No self-approve.** The CI token is submit-scope; approval is a separate,
   trusted authority (human moderator or trusted-vendor policy).
+
+## Non-extension repos: GitHub Release decoration
+
+Repos that cut `v*` tags but do **not** publish an npm package (plain repos,
+PHP/deploy repos) get the same *tag → shipped-PRs* traceability from a separate,
+much thinner reusable workflow:
+[`.github/workflows/reusable-release-notes.yml`](../.github/workflows/reusable-release-notes.yml).
+Copy [`github-release.yml`](./github-release.yml) into the repo at
+`.github/workflows/github-release.yml` and pin the `uses:` ref to a commit SHA.
+It creates (or backfills, when the body is empty) the tag's GitHub Release with
+auto-generated PR-list notes; it needs only `contents: write` and **no
+secrets**. Semver gate, annotated-tag requirement, `--verify-tag` and the
+never-overwrite-authored-notes rule are enforced inside the reusable workflow.
+
+## The org-wide release contract
+
+What a release carries per repo type (core / npm extensions / non-extension
+repos), the packlist leak gate, the package.json `files` allowlist convention
+and the `.gitattributes export-ignore` source-archive rules are documented in
+one page:
+[`cinatra-ai/ci/docs/release-contract.md`](https://github.com/cinatra-ai/ci/blob/main/docs/release-contract.md).
