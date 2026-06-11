@@ -3,7 +3,7 @@
 #
 # Drop this file into an extracted extension repo at:
 #     .github/workflows/release.yml
-# (the v6.22 extractor already ships an identical caller into every extracted
+# (the extension-repo extractor already ships an identical caller into every extracted
 # repo; this is the canonical reference copy for hand-wiring or auditing.)
 #
 # A published GitHub Release whose tag is `v<package.json.version>` builds +
