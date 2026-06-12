@@ -492,12 +492,34 @@ jobs:
         with:
           name: npm-pack-tarball
 
-      # Idempotent across both triggers. A `release: published` run means the
-      # Release already exists: keep it, backfill auto-generated notes ONLY when
-      # its body is empty (never overwrite author-written notes), and attach the
-      # assets (--clobber makes re-runs safe). A workflow_dispatch backfill on a
-      # bare tag creates the Release; --verify-tag refuses to invent a tag, so
-      # this workflow NEVER creates tags — owners cut tags, CI only decorates.
+      # Immutable-safe decoration. Two distinct paths, both idempotent:
+      #
+      # 1. CREATE path (the tag has no Release yet — the normal post-submit case,
+      #    and every workflow_dispatch backfill on a bare tag). `gh release create`
+      #    is handed the tarball + SHA256SUMS.txt as POSITIONAL ASSET ARGS, so it
+      #    runs the draft→upload-assets→publish sequence in ONE operation: the
+      #    assets are attached to the DRAFT and are therefore present at the instant
+      #    of publish. Under GitHub Immutable Releases (which locks assets only
+      #    AFTER publish) this is the supported pattern — the release is born
+      #    immutable WITH its assets, never mutated afterward. `--verify-tag` is
+      #    preserved: it aborts if the tag does not already exist, so this workflow
+      #    NEVER creates tags — owners cut tags, CI only decorates. No `--clobber`
+      #    here: a fresh release has nothing to clobber, and `create` already
+      #    publishes the final asset set atomically.
+      #
+      # 2. EXISTING-RELEASE fallback (a `release: published` run where the publish
+      #    event already materialized the Release before this job ran — the
+      #    pre-immutability era). Backfill auto-generated notes ONLY when the body
+      #    is empty (never overwrite author-written notes), then attach the assets
+      #    via `gh release upload --clobber` (re-run safe). This path can only ever
+      #    succeed against a MUTABLE release. POST-FLIP it can never mutate an
+      #    immutable release: the upload/edit returns HTTP 422 (the release is
+      #    locked), `decorate` returns non-zero, and the error fails LOUD below — it
+      #    is NOT swallowed by the missing-write warning (that warning matches the
+      #    403 contents:write signature only). An immutable existing release that
+      #    lacks assets is an unreachable state for releases born through path 1, so
+      #    this fallback is a graceful bridge for legacy releases, not a mutation of
+      #    immutable ones.
       - name: Create/decorate GitHub Release (PR-list notes, tarball, checksums)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -518,21 +540,30 @@ jobs:
           decorate() {
             local body
             if body="$(gh release view "$TAG" --repo "$REPO" --json body --jq '.body // ""' 2>/dev/null)"; then
-              echo "Release $TAG already exists — decorating it."
+              # Path 2: release already exists (legacy/mutable). Decorate in place.
+              echo "Release $TAG already exists — decorating it (mutable-release fallback)."
               if [ -z "${body//[[:space:]]/}" ]; then
                 echo "Empty release body — backfilling auto-generated PR-list notes."
                 gh api "repos/${REPO}/releases/generate-notes" -f tag_name="$TAG" --jq .body > notes.md || return 1
                 gh release edit "$TAG" --repo "$REPO" --notes-file notes.md || return 1
               fi
+              # Will fail LOUD (HTTP 422) if the existing release is immutable.
+              gh release upload "$TAG" --repo "$REPO" --clobber "$TARBALL" SHA256SUMS.txt || return 1
             else
-              gh release create "$TAG" --repo "$REPO" --title "$TAG" --generate-notes --verify-tag || return 1
+              # Path 1: single-operation create-with-assets (draft→upload→publish).
+              # Immutable-safe: assets are present BEFORE the release is published.
+              gh release create "$TAG" "$TARBALL" SHA256SUMS.txt --repo "$REPO" --title "$TAG" --generate-notes --verify-tag || return 1
             fi
-            gh release upload "$TAG" --repo "$REPO" --clobber "$TARBALL" SHA256SUMS.txt || return 1
           }
 
           if ! decorate 2> err.log; then
             cat err.log >&2
-            if grep -qiE 'HTTP 403|Resource not accessible' err.log; then
+            # Swallow ONLY a genuine missing-`contents: write` 403 (so the
+            # marketplace publish still succeeds for not-yet-bumped callers). An
+            # immutability lock surfaces as HTTP 422 / "immutable" and must NOT be
+            # swallowed — it falls through to `exit 1` and fails the job loud.
+            if grep -qiE 'HTTP 403|Resource not accessible' err.log \
+               && ! grep -qiE 'HTTP 422|immutab|cannot be (modified|deleted|added)' err.log; then
               echo "::warning::GITHUB_TOKEN lacks 'contents: write' — the marketplace submit succeeded, but the GitHub Release was not created/decorated. Bump the caller's permissions block (contents: read → write, see examples/release.yml) to enable PR-list notes + tarball/checksums attachment."
               exit 0
             fi
