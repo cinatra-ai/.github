@@ -34,12 +34,35 @@
 // (no rewrite); the SAME safety guard (inside-package, no abs/`..` segment)
 // applies in both modes.
 //
+// DEPENDENCY MODES (cinatra#181 — library dependency closure):
+//   - `cinatra.dependencyMode` absent or "inline" (the DEFAULT — today's
+//     behavior, byte-identical): every runtime dependency reachable from the
+//     entry is INLINED into the bundle and `dependencies` is PRUNED from the
+//     packed manifest. The published artifact stands alone.
+//   - `cinatra.dependencyMode: "closure"` (declare-and-closure): declared
+//     runtime `dependencies` stay EXTERNAL in the bundle and are KEPT in the
+//     packed manifest — at install time the host materializes them from the
+//     package's SIGNED MATERIALIZATION PLAN (publish-time locked; the
+//     installer executes it verbatim). The residual-import check relaxes to
+//     "node builtins OR declared dependencies" (host ABI peers stay refused —
+//     unchanged hazard class). An already-importable entry passes through
+//     VERBATIM but its import graph is residual-VALIDATED (never re-bundled).
+//     A closure package without a serverEntry is legal (its deps are covered
+//     by the plan alone).
+//   Built `register.mjs` + the packed-manifest self-check stay MANDATORY in
+//   BOTH modes. Interim adoption is fail-closed by construction: a closure
+//   tarball published before the host's relaxed install gate deploys is
+//   refused by the bundled-deps gate, and no signed plan exists until the
+//   publish-time signer ships.
+//
 // Library + CLI:
 //   import { buildServerEntryPack } from "./build-server-entry.mjs"
-//   node scripts/extensions/build-server-entry.mjs <packageDir> --out <dir> [--json]
+//   node scripts/extensions/build-server-entry.mjs <packageDir> --out <dir> [--mode inline|closure] [--json]
+//   (`--mode` overrides the manifest's cinatra.dependencyMode — TESTS ONLY;
+//   release CI always builds from the manifest declaration.)
 
 import { cp, mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
-import { builtinModules, createRequire } from "node:module";
+import { createRequire, isBuiltin } from "node:module";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -123,12 +146,398 @@ export const HOST_PROVIDED_PEERS = Object.freeze([
   "@cinatra-ai/mcp-client",
 ]);
 
-const NODE_BUILTINS = new Set(builtinModules);
-
+/**
+ * EXACT builtin recognition (review r3 finding 1): `node:module`'s
+ * `isBuiltin` matches only real builtin specifiers (`fs`, `fs/promises`,
+ * `node:fs`, …) — never first-segment lookalikes like `fs/../left-pad`, which
+ * Node resolves as PACKAGE `fs` with a traversing subpath. Strictly
+ * fail-closed vs the previous first-segment check.
+ */
 function isNodeBuiltin(specifier) {
-  if (specifier.startsWith("node:")) return true;
-  const base = specifier.split("/")[0];
-  return NODE_BUILTINS.has(base);
+  return isBuiltin(specifier);
+}
+
+/**
+ * Collapse a bare specifier to its base package (`@scope/name/sub` →
+ * `@scope/name`, `pkg/sub` → `pkg`). Returns null for relative/absolute
+ * specifiers. Inlined for the standalone contract — mirrors
+ * `basePackageOfSpecifier` in `src/lib/extension-package-store-core.ts`.
+ */
+function basePackageOfSpecifier(spec) {
+  if (typeof spec !== "string" || spec.length === 0) return null;
+  if (spec.startsWith(".") || spec.startsWith("/")) return null;
+  if (spec.startsWith("@")) {
+    const parts = spec.split("/");
+    return parts.length >= 2 ? `${parts[0]}/${parts[1]}` : null;
+  }
+  return spec.split("/")[0];
+}
+
+// ---------------------------------------------------------------------------
+// Known-optional native-addon allowlist (the ONLY residual externals tolerated
+// besides node builtins). esbuild cannot inline a `.node` native addon, so such
+// a package survives as a residual `require()` in the bundle. The general rule
+// MUST stay fail-closed — an unresolvable bare import would ENOENT at
+// activation — so this allowlist is exhaustively enumerated, never a heuristic.
+//
+// Each entry is a `ws` OPTIONAL native peer (`ws` is reached transitively
+// through `openai`'s websocket transport) that `ws` loads behind a GUARDED
+// `require()` inside try/catch with an ALREADY-ACTIVE pure-JS fallback:
+//   try { const x = require('bufferutil'); /* fast path */ }
+//   catch (e) { /* Continue regardless — the pure-JS path stays installed */ }
+// esbuild emits exactly that as a `require-call` (kind: "require-call", via the
+// module-scoped `createRequire` banner), so at runtime in the store dir the
+// require throws, the catch swallows it, and `ws` runs in pure JS. The built
+// `register.mjs` therefore imports cleanly with these addons ABSENT — verified
+// by executing the bundle under bare node with neither addon resolvable.
+//
+// This is NOT a general "allow native addons" relaxation: a native addon loaded
+// via a STATIC/unguarded import (no try/catch fallback) would crash activation,
+// and is correctly still refused because it is not on this list. Any new entry
+// must be re-proven to carry a pure-JS fallback before being added.
+// ---------------------------------------------------------------------------
+export const KNOWN_OPTIONAL_NATIVE_ADDONS = Object.freeze(["bufferutil", "utf-8-validate"]);
+
+/**
+ * True ONLY for a residual import that is BOTH:
+ *   (1) an EXACT allowlisted specifier — `bufferutil` / `utf-8-validate` with NO
+ *       subpath. `ws` loads them as bare `require('bufferutil')`; an addon is a
+ *       single `.node` binding with no subpath surface. Exact-match (not
+ *       base-package) so a traversal lookalike (`bufferutil/../left-pad`,
+ *       `bufferutil/../@cinatra-ai/sdk-extensions`, `bufferutil/foo`) can NEVER
+ *       ride the allowlisted base past the host-peer / declared-dep gates
+ *       (codex r-openai finding 1); AND
+ *   (2) a GUARDED `require-call` (esbuild `kind: "require-call"`). The whole
+ *       safety property is that the require throws inside ws's try/catch and the
+ *       pure-JS fallback takes over. A STATIC `import "bufferutil"` (or any other
+ *       kind) is uncatchable at module-eval and would ENOENT at activation, so
+ *       it is NOT allowlisted — it stays refused (codex r-openai findings 2/3).
+ * Fail-closed: anything not exactly enumerated AND require-call returns false.
+ * @param {{ path?: unknown, kind?: unknown }} imp - the esbuild metafile import record.
+ */
+/**
+ * Verify that EVERY occurrence of an allowlisted-addon `require(...)` in the
+ * EMITTED bundle text sits inside a `try { … }` block (codex r-openai-2 MED:
+ * esbuild's `kind: "require-call"` proves it is a CJS require, not a static
+ * import, but does NOT prove it is GUARDED — an UNGUARDED top-level
+ * `require("bufferutil")` would still ENOENT at activation when the addon is
+ * absent). esbuild emits the inlined CJS guard verbatim as
+ *   `try { … const x = <REQ>("bufferutil"); … } catch (e) { … }`
+ * where `<REQ>` is the banner's module-scoped require (commonly minified to
+ * `__require`). For each match we walk BACKWARD through the brace structure: at
+ * every unmatched `{` opener we hit, if its head is a `try` we accept; if we
+ * exit the enclosing function/program scope first, the require is UNGUARDED and
+ * we refuse. This makes the allowlist mean exactly "ws's guarded optional
+ * fallback", fail-closed, instead of "any require-call to these names". Applies
+ * to bundles THIS builder emits (inline + closure bundle modes); a verbatim
+ * prebuilt closure passthrough is the publisher's own artifact and is bounded
+ * by the exact-specifier require-call rule plus the residual scan.
+ *
+ * @param {string} bundleText  emitted register.mjs source
+ * @param {string} packageName for the error message
+ */
+export function assertAllowlistedAddonsAreGuarded(bundleText, packageName) {
+  // Neutralize strings/comments ONCE up front (length-preserving) for the brace
+  // scan AND for distinguishing a real call from a name inside a comment/string.
+  // We match call sites against the RAW text (the require ARGUMENT is itself a
+  // string literal we must see), then reject any match whose require IDENTIFIER
+  // lands in a blanked (comment/string) region of the neutralized view.
+  const code = neutralizeLiteralsAndComments(bundleText);
+  for (const addon of KNOWN_OPTIONAL_NATIVE_ADDONS) {
+    // A `require`-style identifier (require / __require / a-renamed-require) +
+    // `("<addon>")`, matched on the raw bundle.
+    const requireCallRe = new RegExp(`\\b[\\w$]*require[\\w$]*\\s*\\(\\s*(['"])${addon.replace(/[-]/g, "\\$&")}\\1\\s*\\)`, "g");
+    let m;
+    while ((m = requireCallRe.exec(bundleText)) !== null) {
+      // A `require` whose identifier sits in a comment/string (blanked) is not a
+      // real call — skip it (the `inComment` false-positive class).
+      if (code[m.index] === " " || code[m.index] === "\n") continue;
+      if (!isInsideTryBlock(code, m.index)) {
+        throw new Error(
+          `[build-server-entry] ${packageName}: the bundled server entry calls require("${addon}") ` +
+            `OUTSIDE a try/catch guard. The known-optional native-addon allowlist covers ONLY a guarded ` +
+            `optional require with a pure-JS fallback (as \`ws\` ships it); an unguarded require would fail ` +
+            `activation when the addon is absent. Inline it or guard it.`,
+        );
+      }
+    }
+  }
+}
+
+/**
+ * True if `pos` (the start of a require call) is lexically inside a `try { … }`
+ * block WHOSE handler is a `catch` (the only form that SWALLOWS the throw — a
+ * `try { … } finally { }` with no catch re-propagates and would still crash
+ * activation, so it is NOT guarded; codex r-openai-final MED). `code` is the
+ * ALREADY-neutralized source (strings/comments blanked) so braces never
+ * miscount. Walks backward to each unmatched `{` enclosing `pos`; when one is a
+ * `try` head, finds that block's matching close `}` and requires a `catch`
+ * after it. Keeps walking outward otherwise (an outer try may still guard it).
+ */
+function isInsideTryBlock(code, pos) {
+  let depth = 0;
+  for (let i = pos - 1; i >= 0; i--) {
+    const c = code[i];
+    if (c === "}") depth++;
+    else if (c === "{") {
+      if (depth > 0) {
+        depth--;
+        continue;
+      }
+      // Unmatched opener enclosing `pos`. Inspect the head before `{`.
+      const before = code.slice(0, i).replace(/\s+$/, "");
+      if (/\btry$/.test(before) && tryBlockHasCatch(code, i)) return true;
+      // Any other enclosing block (function body, if, for, bare block) OR a
+      // catch-less try — keep walking outward; an outer try may still guard it.
+    }
+  }
+  return false;
+}
+
+/**
+ * Given `openBrace` = the index of a `try` block's `{`, scan forward to its
+ * matching `}` and return true iff a `catch` clause follows (optionally
+ * `catch (e)` / `catch {`). A `finally`-only handler returns false. `code` is
+ * neutralized so inner braces are structural.
+ */
+function tryBlockHasCatch(code, openBrace) {
+  let depth = 0;
+  let close = -1;
+  for (let i = openBrace; i < code.length; i++) {
+    const c = code[i];
+    if (c === "{") depth++;
+    else if (c === "}") {
+      depth--;
+      if (depth === 0) {
+        close = i;
+        break;
+      }
+    }
+  }
+  if (close === -1) return false; // unbalanced — fail-closed
+  // Whatever follows the close brace, ignoring whitespace, must START a catch.
+  const after = code.slice(close + 1).replace(/^\s+/, "");
+  return /^catch\b/.test(after);
+}
+
+/**
+ * Replace JS string literals (', ", `) and comments (// , block) in `s` with
+ * equal-length runs of spaces so structural brace scanning ignores their
+ * contents. Length-preserving (indices stay valid). Best-effort lexer adequate
+ * for esbuild's well-formed output; ambiguous cases collapse to "treat as code"
+ * which is the fail-LOUD direction for the guard check.
+ */
+function neutralizeLiteralsAndComments(s) {
+  let out = "";
+  let i = 0;
+  const n = s.length;
+  while (i < n) {
+    const c = s[i];
+    const c2 = s[i + 1];
+    if (c === "/" && c2 === "/") {
+      let j = i;
+      while (j < n && s[j] !== "\n") j++;
+      out += " ".repeat(j - i);
+      i = j;
+    } else if (c === "/" && c2 === "*") {
+      let j = i + 2;
+      while (j < n && !(s[j] === "*" && s[j + 1] === "/")) j++;
+      j = Math.min(n, j + 2);
+      out += " ".repeat(j - i);
+      i = j;
+    } else if (c === '"' || c === "'" || c === "`") {
+      const quote = c;
+      let j = i + 1;
+      while (j < n && s[j] !== quote) {
+        if (s[j] === "\\") j++;
+        j++;
+      }
+      j = Math.min(n, j + 1);
+      // Preserve newlines inside template literals so line structure is stable.
+      out += s.slice(i, j).replace(/[^\n]/g, " ");
+      i = j;
+    } else {
+      out += c;
+      i++;
+    }
+  }
+  return out;
+}
+
+export function isKnownOptionalNativeAddon(imp) {
+  if (!imp || typeof imp !== "object") return false;
+  if (imp.kind !== "require-call") return false;
+  // EXACT specifier (no subpath) — KNOWN_OPTIONAL_NATIVE_ADDONS holds the only
+  // legal whole specifiers; a subpath/lookalike never matches.
+  return KNOWN_OPTIONAL_NATIVE_ADDONS.includes(imp.path);
+}
+
+// ---------------------------------------------------------------------------
+// Dependency mode (cinatra#181) — inline-and-prune vs declare-and-closure.
+// ---------------------------------------------------------------------------
+
+export const DEPENDENCY_MODES = Object.freeze(["inline", "closure"]);
+
+/**
+ * Resolve the effective dependency mode: the `--mode` CLI override (TESTS
+ * ONLY) wins, else the manifest's `cinatra.dependencyMode`, else "inline"
+ * (today's behavior, byte-identical). Anything outside the two declared modes
+ * is a fail-loud refusal — a typo must never silently build inline.
+ */
+export function resolveDependencyMode(cinatra, modeOverride, packageName) {
+  const candidate = modeOverride ?? (cinatra && typeof cinatra === "object" ? cinatra.dependencyMode : undefined);
+  if (candidate === undefined || candidate === null) return "inline";
+  if (DEPENDENCY_MODES.includes(candidate)) return candidate;
+  throw new Error(
+    `[build-server-entry] ${packageName}: cinatra.dependencyMode ${JSON.stringify(candidate)} is not a ` +
+      `supported mode (expected "inline" or "closure", or omit the field for the inline default).`,
+  );
+}
+
+/**
+ * Classify one residual EXTERNAL import of a CLOSURE-mode entry graph. Returns
+ * null when the import is allowed, else the refusal reason. Shared by the
+ * closure-mode bundle residual check and the closure-mode passthrough
+ * validation so the two can never drift. (The inline-mode residual check is
+ * untouched — its bundle may import node builtins ONLY, byte-identical to the
+ * pre-mode builder.)
+ *  - node builtins: allowed;
+ *  - host ABI peers: ALWAYS refused (unchanged hazard class — the host
+ *    provides the single shared instance; a runtime value import can never
+ *    resolve from the store dir);
+ *  - declared runtime dependencies: allowed (the signed materialization plan
+ *    covers them at install);
+ *  - anything else: refused. Self-references never surface here — both modes
+ *    resolve them INTO the scanned graph (esbuild's native self-reference
+ *    resolution in bundle mode; the pinned exports-map trace in the
+ *    passthrough scan), so an unresolvable one is a build/scan error, never a
+ *    silent allowance (review r0 finding 1).
+ */
+function classifyClosureResidualImport(imp, { declaredDeps }) {
+  const specifier = imp.path;
+  if (isNodeBuiltin(specifier)) return null;
+  const base = basePackageOfSpecifier(specifier);
+  if (base !== null && HOST_PROVIDED_PEERS.includes(base)) {
+    return (
+      `imports host ABI peer "${specifier}" at runtime — host-provided peers must stay type-only ` +
+      `(take values via ctx capabilities) in EVERY dependency mode`
+    );
+  }
+  // Known-optional native addon (e.g. ws's bufferutil/utf-8-validate): allowed
+  // in EVERY dependency mode — but ONLY as the exact specifier via a GUARDED
+  // require-call (the guarded `require()` falls back to pure JS when the addon
+  // is absent from the store dir). A subpath/lookalike or a static import is
+  // NOT allowlisted, so it can never smuggle a peer/undeclared dep past this
+  // gate (the full import record carries `kind`).
+  if (isKnownOptionalNativeAddon(imp)) return null;
+  if (base !== null && declaredDeps.has(base)) {
+    // Subpath-safety (review r2 finding 1): `dep/../left-pad/...` shares
+    // the `dep` base but Node-resolves OUTSIDE the declared package. The
+    // remainder after the base must be clean path segments — no `.`/`..`,
+    // no empties, no backslashes, no percent-encoding (Node refuses encoded
+    // separators in bare specifiers; we refuse `%` wholesale).
+    const remainder = specifier.slice(base.length);
+    const remainderUnsafe =
+      remainder.length > 0 &&
+      (/[\\%]/.test(remainder) ||
+        remainder
+          .replace(/^\//, "")
+          .split("/")
+          .some((seg) => seg === "" || seg === "." || seg === ".."));
+    if (!remainderUnsafe) return null;
+    return (
+      `imports "${specifier}" at runtime — a traversal-unsafe subpath of declared dependency ` +
+      `"${base}" (Node would resolve it outside that package)`
+    );
+  }
+  return (
+    `imports "${specifier}" at runtime, which is neither a node builtin nor a declared runtime ` +
+    `dependency — declare it in "dependencies" (the signed materialization plan must cover it) ` +
+    `or inline it`
+  );
+}
+
+/** Valid npm package name (scoped or not) — the alias-target shape gate. */
+const NPM_PACKAGE_NAME_RE = /^(@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/;
+
+/**
+ * ALLOWLIST test for a registry version spec (review r1 finding 1): a
+ * semver range / x-range / hyphen range / `||` union / dist-tag. Every
+ * non-registry source npm understands carries a protocol marker (`file:`,
+ * `link:`, `workspace:`, `portal:`, `patch:`, `catalog:`, `git+…:`, `ssh:`,
+ * `http(s):`) or a path separator (GitHub shorthand `user/repo`, relative
+ * paths) — both are refused wholesale, so a NEW protocol npm grows is refused
+ * by default instead of slipping through a denylist.
+ */
+function isRegistryRangeOrTag(spec) {
+  return typeof spec === "string" && spec.trim().length > 0 && !/[:/\\]/.test(spec) && !spec.trim().startsWith(".");
+}
+
+/**
+ * Closure-mode dependency-spec gate (review r0 finding 2, allowlisted per
+ * r1 finding 1; aliases refused per the PR-2 merge-safe round): the declared
+ * `dependencies` are the basis of the publish-time SIGNED materialization
+ * plan, so in closure mode every spec must be a PLAIN registry spec — an
+ * explicit range / x-range / union / dist-tag under the dependency's REAL
+ * package name.
+ *  - a host ABI peer as a dependency KEY is refused (never a closure library;
+ *    the install gate refuses it too);
+ *  - an `npm:` ALIAS whose target is a host ABI peer is refused (alias
+ *    smuggling — the import would ride the alias key past the peer check);
+ *  - every OTHER `npm:` alias is refused too: the signed plan format
+ *    (`cinatra-materialization-plan/v1`) carries a SINGLE identity per node —
+ *    the `node_modules` placement name IS the registry package name — so an
+ *    aliased dependency (placement name != registry identity) is not
+ *    expressible. Depend on the real name instead;
+ *  - everything else (file/link/workspace/portal/patch/catalog/git/
+ *    GitHub-shorthand/URL/non-string/empty) is refused — the plan derives
+ *    from a committed lockfile with REGISTRY sources only (the signer side
+ *    refuses these at plan computation; the builder fails the same class at
+ *    build time, fail-closed by construction for anything new).
+ */
+function assertClosureDependencySpecs(packageName, deps) {
+  const entries = Object.entries(deps ?? {});
+  const hostPeerDeps = entries.filter(([dep]) => HOST_PROVIDED_PEERS.includes(dep)).map(([dep]) => dep);
+  if (hostPeerDeps.length > 0) {
+    throw new Error(
+      `[build-server-entry] ${packageName}: host ABI peer(s) declared in "dependencies" ` +
+        `(${hostPeerDeps.join(", ")}) — these are host-provided peers, never closure libraries. ` +
+        `Declare them in "peerDependencies"; the install gate refuses this shape too.`,
+    );
+  }
+  for (const [dep, rawSpec] of entries) {
+    const spec = typeof rawSpec === "string" ? rawSpec.trim() : null;
+    if (spec !== null && spec.startsWith("npm:")) {
+      const aliasTarget = spec.slice("npm:".length);
+      // Base package of the alias target: `@scope/name@range` → `@scope/name`,
+      // `name@range` → `name` (the version separator is the first `@` past the
+      // scope marker).
+      const sepIdx = aliasTarget.startsWith("@") ? aliasTarget.indexOf("@", 1) : aliasTarget.indexOf("@");
+      const aliasBase = sepIdx === -1 ? aliasTarget : aliasTarget.slice(0, sepIdx);
+      if (HOST_PROVIDED_PEERS.includes(aliasBase)) {
+        throw new Error(
+          `[build-server-entry] ${packageName}: dependency "${dep}" is an npm alias of host ABI peer ` +
+            `"${aliasBase}" (${spec}) — host-provided peers can never be closure libraries, aliased or not.`,
+        );
+      }
+      throw new Error(
+        `[build-server-entry] ${packageName}: dependency "${dep}" is an npm: alias (${spec}) — ` +
+          `the SIGNED materialization plan format (cinatra-materialization-plan/v1) carries a ` +
+          `single identity per node (the node_modules placement name IS the registry package ` +
+          `name), so aliased dependencies are not expressible in closure mode. ` +
+          `Depend on ${NPM_PACKAGE_NAME_RE.test(aliasBase) ? `"${aliasBase}"` : "the target package"} under its real name instead.`,
+      );
+    }
+    if (spec === null || !isRegistryRangeOrTag(spec)) {
+      throw new Error(
+        `[build-server-entry] ${packageName}: dependency "${dep}" has a non-registry spec ` +
+          `(${spec === null ? JSON.stringify(rawSpec) : spec}) — closure mode accepts ONLY plain ` +
+          `registry ranges/tags; the SIGNED materialization plan derives from a committed ` +
+          `lockfile with registry sources only (git/file/link/workspace/portal/patch/` +
+          `catalog/URL/alias sources are refused at plan computation too).`,
+      );
+    }
+  }
 }
 
 /** Map an esbuild metafile input path (`node_modules/...`) to its package name. */
@@ -186,30 +595,36 @@ async function copyPackageTree(packageDir, packDir) {
  *                    manifest untouched;
  *  - "bundled"     — the declared entry resolves to TS source: esbuild-bundle
  *                    it to top-level `register.mjs` (format esm, platform
- *                    node, externals = host ABI peers only, conditions
- *                    ["react-server"] + the next/<api> react-server aliasing
- *                    so the graph gets the same server-layer module views the
- *                    host's RSC compile produces) and rewrite the PACKED
- *                    manifest: `cinatra.serverEntry: "./register.mjs"`,
- *                    `register.mjs` appended to `files`, and `dependencies`
- *                    PRUNED — the bundle inlines the entry's whole runtime
- *                    graph, and the materializer's bundled-deps gate requires
- *                    every remaining `dependencies` entry to ship under
- *                    `node_modules` (which npm pack never includes), so a
- *                    published runtime artifact carries no `dependencies`.
+ *                    node, externals = host ABI peers — plus, in closure
+ *                    dependency mode, the declared runtime dependencies —
+ *                    conditions ["react-server"] + the next/<api> react-server
+ *                    aliasing so the graph gets the same server-layer module
+ *                    views the host's RSC compile produces) and rewrite the
+ *                    PACKED manifest: `cinatra.serverEntry: "./register.mjs"`,
+ *                    `register.mjs` appended to `files`. In INLINE dependency
+ *                    mode (the default) `dependencies` is PRUNED — the bundle
+ *                    inlines the entry's whole runtime graph, and the
+ *                    materializer's bundled-deps gate requires every remaining
+ *                    `dependencies` entry to ship under `node_modules` (which
+ *                    npm pack never includes), so a published inline artifact
+ *                    carries no `dependencies`. In CLOSURE mode `dependencies`
+ *                    is KEPT — the host materializes it from the signed plan.
  *                    UI-only deps play no role in the runtime store (UI stays
  *                    host-compiled via the static path — design §4.1).
  *
  * Fail-loud refusals (throws): declared exports key with an out-of-contract
  * target; entry escaping the package dir; entry file missing; extensionless /
- * unknown-extension resolution; a bundle that STILL imports anything beyond
- * node builtins (host peers must be type-only / ctx-resolved; runtime deps
- * must be inlinable).
+ * unknown-extension resolution; an unsupported `cinatra.dependencyMode`; a
+ * host ABI peer declared in `dependencies` (closure mode — the install gate
+ * refuses it too); a bundle that STILL imports anything beyond node builtins
+ * (inline mode) or beyond node builtins + declared dependencies (closure
+ * mode; host peers refused in both); a closure-mode PASSTHROUGH entry whose
+ * import graph violates the same closure residual rule.
  *
- * @param {{ packageDir: string, outDir?: string | null, esbuildDir?: string | null, quiet?: boolean }} options
- * @returns {Promise<{ mode: "none" | "passthrough" | "bundled", packDir: string, packageName: string, entryRel: string | null, inlinedPackages: string[], prunedDependencies: string[] }>}
+ * @param {{ packageDir: string, outDir?: string | null, esbuildDir?: string | null, mode?: "inline" | "closure" | null, quiet?: boolean }} options
+ * @returns {Promise<{ mode: "none" | "passthrough" | "bundled", dependencyMode: "inline" | "closure", packDir: string, packageName: string, entryRel: string | null, inlinedPackages: string[], prunedDependencies: string[], declaredDependencies: string[] }>}
  */
-export async function buildServerEntryPack({ packageDir, outDir, esbuildDir, quiet = true } = {}) {
+export async function buildServerEntryPack({ packageDir, outDir, esbuildDir, mode = null, quiet = true } = {}) {
   if (!packageDir) throw new Error("[build-server-entry] packageDir is required");
   const pkgDir = path.resolve(packageDir);
   const manifestPath = path.join(pkgDir, "package.json");
@@ -222,14 +637,33 @@ export async function buildServerEntryPack({ packageDir, outDir, esbuildDir, qui
   const serverEntry =
     cinatra && typeof cinatra.serverEntry === "string" ? cinatra.serverEntry : null;
 
+  // -- dependency mode (cinatra#181): manifest-declared, CLI-overridable for
+  // tests only; absent → "inline" (today's behavior, byte-identical).
+  const dependencyMode = resolveDependencyMode(cinatra, mode, name);
+  const declaredDependencies = Object.keys(pkg.dependencies ?? {}).sort();
+  if (dependencyMode === "closure") {
+    assertClosureDependencySpecs(name, pkg.dependencies);
+  }
+
   const packDir = outDir
     ? path.resolve(outDir)
     : path.join(await mkdtemp(path.join(tmpdir(), "cinatra-server-entry-pack-")), "package");
 
-  // -- no serverEntry: verbatim pack dir, nothing to build or rewrite.
+  // -- no serverEntry: verbatim pack dir, nothing to build or rewrite. Legal
+  // in BOTH dependency modes (a closure package without a server entry keeps
+  // its declared deps; the signed plan alone covers them).
   if (!serverEntry) {
     await copyPackageTree(pkgDir, packDir);
-    return { mode: "none", packDir, packageName: name, entryRel: null, inlinedPackages: [], prunedDependencies: [] };
+    return {
+      mode: "none",
+      dependencyMode,
+      packDir,
+      packageName: name,
+      entryRel: null,
+      inlinedPackages: [],
+      prunedDependencies: [],
+      declaredDependencies,
+    };
   }
 
   // -- shared resolution + safety guard (identical semantics to the store).
@@ -261,9 +695,36 @@ export async function buildServerEntryPack({ packageDir, outDir, esbuildDir, qui
   const cls = classifyServerEntryArtifact(rel);
 
   // -- already-built entry: pass through verbatim (mode split, design §4.1).
+  // NEVER re-bundled — a publisher's built artifact is theirs. In closure
+  // dependency mode the entry's import graph is additionally residual-
+  // VALIDATED (node builtins / self-references / declared deps only; host
+  // peers refused) so a closure passthrough that could never activate fails
+  // HERE, at build time, with the same rule the bundle check applies.
   if (cls === "importable") {
+    if (dependencyMode === "closure") {
+      const esbuild = await loadEsbuild(esbuildDir);
+      await validateClosureEntryImports({
+        esbuild,
+        entryAbs,
+        pkgDir,
+        packageName: name,
+        entryRel: rel,
+        declaredDeps: new Set(declaredDependencies),
+        selfName: typeof pkg.name === "string" ? pkg.name : null,
+        exportsMap: pkg.exports,
+      });
+    }
     await copyPackageTree(pkgDir, packDir);
-    return { mode: "passthrough", packDir, packageName: name, entryRel: rel, inlinedPackages: [], prunedDependencies: [] };
+    return {
+      mode: "passthrough",
+      dependencyMode,
+      packDir,
+      packageName: name,
+      entryRel: rel,
+      inlinedPackages: [],
+      prunedDependencies: [],
+      declaredDependencies,
+    };
   }
 
   if (cls !== "source") {
@@ -280,13 +741,21 @@ export async function buildServerEntryPack({ packageDir, outDir, esbuildDir, qui
   // into the staged pack dir).
   await copyPackageTree(pkgDir, packDir);
   const esbuild = await loadEsbuild(esbuildDir);
-  // Externals are the host ABI peers ONLY. Everything else reachable from the
-  // entry is INLINED: the runtime store provides no module resolution beyond
-  // node builtins, so any surviving bare import would fail activation with
-  // ENOENT. react/react-dom (declared peers for the UI/static path) are
-  // deliberately NOT external — a server-entry graph that reaches them gets
-  // their react-server builds inlined, exactly the host RSC layer's view.
+  // INLINE mode: externals are the host ABI peers ONLY. Everything else
+  // reachable from the entry is INLINED: the runtime store provides no module
+  // resolution beyond node builtins, so any surviving bare import would fail
+  // activation with ENOENT. react/react-dom (declared peers for the UI/static
+  // path) are deliberately NOT external — a server-entry graph that reaches
+  // them gets their react-server builds inlined, exactly the host RSC layer's
+  // view.
+  // CLOSURE mode: declared runtime dependencies are ADDITIONALLY external
+  // (`dep` + `dep/*` subpaths) — at install time the host materializes them
+  // into the store dir's real nested node_modules from the signed
+  // materialization plan, so Node's plain file:// resolution finds them.
   const externals = [...HOST_PROVIDED_PEERS];
+  if (dependencyMode === "closure") {
+    for (const dep of declaredDependencies) externals.push(dep, `${dep}/*`);
+  }
   const outfile = path.join(packDir, "register.mjs");
   // HOST-RUNTIME MODULE VIEWS (the explicit build-time-input contract):
   //  - `server-only` is BUILDER-SHIMMED to an empty module — semantically
@@ -367,24 +836,51 @@ export async function buildServerEntryPack({ packageDir, outDir, esbuildDir, qui
     logLevel: quiet ? "silent" : "warning",
   });
 
-  // -- residual-import check: a correct server-entry bundle imports NOTHING
-  // beyond node builtins. A surviving host-peer/peer import means the source
-  // graph value-imports something the host provides per ABI through ctx — the
+  // -- residual-import check. INLINE mode (byte-identical to the pre-mode
+  // builder): a correct server-entry bundle imports NOTHING beyond node
+  // builtins — a surviving host-peer/peer import means the source graph
+  // value-imports something the host provides per ABI through ctx; the
   // store's host-peer gate would refuse it at install; fail at BUILD time
-  // with the same actionable direction.
+  // with the same actionable direction. CLOSURE mode: residual externals may
+  // additionally be declared runtime dependencies (the signed plan covers
+  // them); host peers stay refused.
   const outputKey = Object.keys(result.metafile.outputs).find((k) => k.endsWith("register.mjs"));
-  const residual = (result.metafile.outputs[outputKey]?.imports ?? [])
-    .filter((imp) => imp.external === true && !isNodeBuiltin(imp.path))
-    .map((imp) => imp.path);
-  if (residual.length > 0) {
-    throw new Error(
-      `[build-server-entry] ${name}: the bundled server entry still imports ${residual
-        .map((s) => `"${s}"`)
-        .join(", ")} at runtime. A publishable server entry may import only node builtins — ` +
-        `host-provided peers must stay type-only (take values via ctx capabilities), and every ` +
-        `runtime dependency must be inlinable into the bundle.`,
-    );
+  const residualImports = (result.metafile.outputs[outputKey]?.imports ?? []).filter(
+    (imp) => imp.external === true,
+  );
+  if (dependencyMode === "closure") {
+    const declaredSet = new Set(declaredDependencies);
+    for (const imp of residualImports) {
+      const refusal = classifyClosureResidualImport(imp, { declaredDeps: declaredSet });
+      if (refusal !== null) {
+        throw new Error(`[build-server-entry] ${name}: the bundled server entry ${refusal}.`);
+      }
+    }
+  } else {
+    // Allow node builtins AND the known-optional native-addon allowlist (ws's
+    // bufferutil/utf-8-validate — exact specifier via a GUARDED require-call,
+    // which falls back to pure JS); everything else (host peers, un-inlinable
+    // deps, un-allowlisted native addons, static imports) is refused, fail-closed.
+    const residual = residualImports
+      .filter((imp) => !isNodeBuiltin(imp.path) && !isKnownOptionalNativeAddon(imp))
+      .map((imp) => imp.path);
+    if (residual.length > 0) {
+      throw new Error(
+        `[build-server-entry] ${name}: the bundled server entry still imports ${residual
+          .map((s) => `"${s}"`)
+          .join(", ")} at runtime. A publishable server entry may import only node builtins ` +
+          `(plus the known-optional native addons ${KNOWN_OPTIONAL_NATIVE_ADDONS.map((s) => `"${s}"`).join(", ")}, ` +
+          `which fall back to pure JS) — host-provided peers must stay type-only (take values via ctx ` +
+          `capabilities), and every other runtime dependency must be inlinable into the bundle.`,
+      );
+    }
   }
+
+  // -- guard verification (codex r-openai-2): an allowlisted addon is tolerated
+  // ONLY when its emitted `require(...)` sits inside a try/catch (ws's optional
+  // fallback shape). An UNGUARDED require of these names would still ENOENT at
+  // activation — refuse it here, fail-closed, by scanning the emitted bundle.
+  assertAllowlistedAddonsAreGuarded(await readFile(outfile, "utf8"), name);
 
   // -- inlined packages (from the metafile input set) → the pruned-deps record.
   const inlinedPackages = [
@@ -395,11 +891,18 @@ export async function buildServerEntryPack({ packageDir, outDir, esbuildDir, qui
     ),
   ].sort();
 
-  // -- manifest rewrite IN THE PACK DIR ONLY (design §4.1 step 3).
+  // -- manifest rewrite IN THE PACK DIR ONLY (design §4.1 step 3). INLINE
+  // mode prunes `dependencies` (the bundle inlined the whole runtime graph);
+  // CLOSURE mode KEEPS the declarations intact — they are the basis of the
+  // publish-time signed materialization plan and of the host's relaxed
+  // bundled-OR-planned install gate.
   const packedPkg = JSON.parse(manifestRaw);
   packedPkg.cinatra = { ...packedPkg.cinatra, serverEntry: "./register.mjs" };
-  const prunedDependencies = Object.keys(packedPkg.dependencies ?? {}).sort();
-  delete packedPkg.dependencies;
+  let prunedDependencies = [];
+  if (dependencyMode !== "closure") {
+    prunedDependencies = Object.keys(packedPkg.dependencies ?? {}).sort();
+    delete packedPkg.dependencies;
+  }
   if (Array.isArray(packedPkg.files) && !packedPkg.files.includes("register.mjs")) {
     packedPkg.files = [...packedPkg.files, "register.mjs"];
   }
@@ -422,12 +925,97 @@ export async function buildServerEntryPack({ packageDir, outDir, esbuildDir, qui
 
   return {
     mode: "bundled",
+    dependencyMode,
     packDir,
     packageName: name,
     entryRel: rel,
     inlinedPackages,
     prunedDependencies,
+    declaredDependencies,
   };
+}
+
+/**
+ * CLOSURE-mode passthrough validation (cinatra#181): trace the PREBUILT
+ * entry's import graph with esbuild in scan mode (`bundle` + `packages:
+ * "external"`, `write: false` — nothing is emitted, the artifact is NEVER
+ * re-bundled) and apply the SAME closure residual rule the bundle check
+ * applies: every surviving bare import must be a node builtin or a declared
+ * runtime dependency; host ABI peers are refused. Relative imports are
+ * traversed (a missing local file fails the scan loudly), and SELF-references
+ * (`<self>` / `<self>/sub`) are resolved INTO the scanned graph through the
+ * pinned exports-map resolver — never blanket-allowed — so a self-referenced
+ * file cannot smuggle a host-peer or undeclared import past the scan (review
+ * r0 finding 1). An unresolvable self-reference fails the scan loudly.
+ *
+ * Residual blind spot (shared with every sibling host gate —
+ * `parseModuleImports` documents the same class): a VARIABLE-indirected
+ * dynamic `import(v)` / `require(v)` / `createRequire(...)(v)` is statically
+ * unresolvable and is not represented in the metafile. LITERAL dynamic
+ * `import("x")` IS captured (test-pinned). The install-time residual-coverage
+ * check and the activation loader share the same static visibility, so the
+ * builder neither weakens nor strengthens that boundary.
+ *
+ * Throws with the offending specifier on the first violation.
+ */
+async function validateClosureEntryImports({ esbuild, entryAbs, pkgDir, packageName, entryRel, declaredDeps, selfName, exportsMap }) {
+  // Self-references resolve INTO the graph through the PINNED resolver
+  // semantics (the same exact-key/one-level-conditional language the store
+  // and loader apply) — esbuild's own (full-Node) exports resolution must not
+  // accept what the runtime store would refuse.
+  const selfReferenceTrace = {
+    name: "cinatra-closure-self-reference-trace",
+    setup(build) {
+      build.onResolve({ filter: /.*/ }, (args) => {
+        if (!selfName) return undefined;
+        const base = basePackageOfSpecifier(args.path);
+        if (base !== selfName) return undefined;
+        const subpath = args.path === selfName ? "." : `.${args.path.slice(selfName.length)}`;
+        const target = resolveExportsSubpath(exportsMap, subpath);
+        if (target === null || entryEscapesPackageDir(target)) {
+          return {
+            errors: [
+              {
+                text:
+                  `self-reference "${args.path}" does not resolve to a safe in-package file through the ` +
+                  `pinned exports-map semantics — the runtime store could not resolve it either`,
+              },
+            ],
+          };
+        }
+        return { path: path.join(pkgDir, target.replace(/^\.\//, "")) };
+      });
+    },
+  };
+  let result;
+  try {
+    result = await esbuild.build({
+      entryPoints: [entryAbs],
+      bundle: true,
+      format: "esm",
+      platform: "node",
+      target: "node20",
+      write: false,
+      metafile: true,
+      packages: "external",
+      plugins: [selfReferenceTrace],
+      logLevel: "silent",
+    });
+  } catch (err) {
+    throw new Error(
+      `[build-server-entry] ${packageName}: closure-mode validation could not trace the prebuilt ` +
+        `server entry "${entryRel}": ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  for (const output of Object.values(result.metafile.outputs)) {
+    for (const imp of output.imports ?? []) {
+      if (imp.external !== true) continue;
+      const refusal = classifyClosureResidualImport(imp, { declaredDeps });
+      if (refusal !== null) {
+        throw new Error(`[build-server-entry] ${packageName}: the prebuilt server entry "${entryRel}" ${refusal}.`);
+      }
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -435,11 +1023,12 @@ export async function buildServerEntryPack({ packageDir, outDir, esbuildDir, qui
 // ---------------------------------------------------------------------------
 
 function parseArgs(argv) {
-  const args = { packageDir: null, out: null, esbuildDir: null, json: false };
+  const args = { packageDir: null, out: null, esbuildDir: null, mode: null, json: false };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === "--out") args.out = argv[++i];
     else if (a === "--esbuild-dir") args.esbuildDir = argv[++i];
+    else if (a === "--mode") args.mode = argv[++i];
     else if (a === "--json") args.json = true;
     else if (a.startsWith("--")) throw new Error(`[build-server-entry] unknown flag ${a}`);
     else if (!args.packageDir) args.packageDir = a;
@@ -447,8 +1036,12 @@ function parseArgs(argv) {
   }
   if (!args.packageDir) {
     throw new Error(
-      "usage: node build-server-entry.mjs <packageDir> [--out <packDir>] [--esbuild-dir <dir>] [--json]",
+      "usage: node build-server-entry.mjs <packageDir> [--out <packDir>] [--esbuild-dir <dir>] " +
+        "[--mode inline|closure] [--json]   (--mode is a TEST-ONLY override of cinatra.dependencyMode)",
     );
+  }
+  if (args.mode !== null && !DEPENDENCY_MODES.includes(args.mode)) {
+    throw new Error(`[build-server-entry] --mode ${args.mode} is not a supported mode (inline|closure)`);
   }
   return args;
 }
@@ -463,12 +1056,14 @@ if (isMain) {
       packageDir: args.packageDir,
       outDir: args.out,
       esbuildDir: args.esbuildDir,
+      mode: args.mode,
     });
     if (args.json) {
       process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     } else {
       process.stdout.write(
-        `[build-server-entry] ${result.packageName}: mode=${result.mode} packDir=${result.packDir}\n`,
+        `[build-server-entry] ${result.packageName}: mode=${result.mode} ` +
+          `dependencyMode=${result.dependencyMode} packDir=${result.packDir}\n`,
       );
     }
   } catch (err) {
