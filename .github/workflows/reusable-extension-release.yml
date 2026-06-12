@@ -11,13 +11,17 @@
 #   - CINATRA_MARKETPLACE_VENDOR_TOKEN is set as a GitHub org secret (submit scope)
 #   - registry.cinatra.ai public-read is enabled (or CINATRA_REGISTRY_TOKEN is set)
 #
-# Flow: build the CI artifact from a clean checkout → packlist leak gate
+# Flow: build the CI artifact from a clean checkout → serverEntry build stage
+# (cinatra#161: a manifest declaring `cinatra.serverEntry` gets its entry
+# esbuild-bundled into a top-level `register.mjs` in a STAGED pack dir whose
+# rewritten manifest satisfies the runtime store's built-artifacts-only
+# contract; packing then runs FROM that stage) → packlist leak gate
 # (`npm pack --dry-run --json` must list no internal path: `.github/`,
 # `.planning`, env files, tests, CI/tooling config — cinatra-engineering#56)
 # → npm pack → provenance attestation → submit the EXACT bytes through the
-# marketplace MCP proxy (extension-submit-for-review), with the
-# dependency-ordering gate enforced locally first. NEVER a direct Verdaccio
-# publish.
+# marketplace MCP proxy (extension-submit-for-review), with the serverEntry
+# packed-manifest preflight + dependency-ordering gate enforced locally first.
+# NEVER a direct Verdaccio publish.
 #
 # After a successful submit, a follow-up job decorates the tag's GitHub Release:
 # auto-generated "What's Changed" PR-list notes + the exact packed tarball +
@@ -34,7 +38,7 @@ on:
         type: string
         default: "24"
       github-repo-ref:
-        description: "Ref of cinatra-ai/.github to fetch release-submit.mjs from."
+        description: "Ref of cinatra-ai/.github to fetch the release tools (release-submit.mjs + build-server-entry.mjs) from."
         type: string
         default: "main"
     secrets:
@@ -163,6 +167,84 @@ jobs:
             echo "no extension-kind-gate.mjs (connector/artifact/skill) — skipping"
           fi
 
+      # ── serverEntry build stage (cinatra#161) ────────────────────────────────
+      # The Cinatra runtime package store is BUILT-ARTIFACTS-ONLY: a published
+      # `cinatra.serverEntry` must resolve to an existing .mjs/.cjs/.js file or
+      # the host REFUSES the install. The in-tree first-party shape
+      # (serverEntry "./register" + exports["./register"] → "./src/register.ts")
+      # is TS source, so when the manifest declares a serverEntry this stage
+      # bundles it with the canonical builder (build-server-entry.mjs — the
+      # byte-synced placement copy of scripts/extensions/build-server-entry.mjs
+      # in the cinatra monorepo) into a STAGED temp pack dir: top-level
+      # register.mjs + the rewritten PACKED manifest (serverEntry
+      # "./register.mjs", inlined runtime `dependencies` pruned, register.mjs
+      # appended to `files`). The source tree is never touched; every later
+      # step (packlist gate, pack, attest, submit) operates on the stage.
+      - name: Detect server entry
+        id: server_entry
+        if: steps.gate.outputs.should_publish == 'true'
+        run: |
+          if node -e "p=require('./package.json');process.exit(p.cinatra&&typeof p.cinatra.serverEntry==='string'?0:1)"; then
+            echo "declared=true" >> "$GITHUB_OUTPUT"
+            echo "cinatra.serverEntry declared — building a runtime-store artifact before packing."
+          else
+            echo "declared=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Fetch the shared release tools (submit CLI + serverEntry builder) from
+      # the org .github repo, then move them OUT of the workspace immediately:
+      # the builder stages a copy of this checkout and `npm pack` can run from
+      # that stage, so a tools dir left in the tree could leak into the tarball.
+      - name: Checkout release tools
+        if: steps.gate.outputs.should_publish == 'true'
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: cinatra-ai/.github
+          ref: ${{ inputs.github-repo-ref }}
+          path: .cinatra-release
+          sparse-checkout: |
+            scripts/v622/templates/release/release-submit.mjs
+            scripts/v622/templates/release/build-server-entry.mjs
+          sparse-checkout-cone-mode: false
+
+      - name: Stage release tools outside the workspace
+        if: steps.gate.outputs.should_publish == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/cinatra-tools"
+          cp .cinatra-release/scripts/v622/templates/release/release-submit.mjs "$RUNNER_TEMP/cinatra-tools/release-submit.mjs"
+          cp .cinatra-release/scripts/v622/templates/release/build-server-entry.mjs "$RUNNER_TEMP/cinatra-tools/build-server-entry.mjs"
+          rm -rf .cinatra-release
+
+      # Build inputs for the bundle: the extension's OWN declared dependencies
+      # (and devDependencies — e.g. `next` as an explicit build-time input for
+      # server graphs that import it) must be installed next to the package so
+      # esbuild can inline the runtime graph. `--legacy-peer-deps` skips peer
+      # auto-install (the @cinatra-ai/* host peers are NEVER on a public
+      # registry — model-B host-provided); `--ignore-scripts` runs no lifecycle
+      # code (same OIDC-hardening rationale as the submit-tool deps step below).
+      - name: Install server-entry build inputs
+        if: steps.gate.outputs.should_publish == 'true' && steps.server_entry.outputs.declared == 'true'
+        run: npm install --ignore-scripts --legacy-peer-deps --no-package-lock --no-audit --no-fund
+
+      # esbuild is the builder's only dependency — installed `--ignore-scripts`
+      # into an ISOLATED temp dir (never the extension tree), the same
+      # hardening pattern as the submit-tool deps step. Version pinned to the
+      # cinatra monorepo's esbuild so release bundles match the e2e-pinned
+      # builder output.
+      - name: Build server entry (runtime-store artifact)
+        id: server_build
+        if: steps.gate.outputs.should_publish == 'true' && steps.server_entry.outputs.declared == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/cinatra-esbuild"
+          ( cd "$RUNNER_TEMP/cinatra-esbuild" && npm install --no-save --no-package-lock --ignore-scripts --no-audit --no-fund esbuild@0.25.12 )
+          node "$RUNNER_TEMP/cinatra-tools/build-server-entry.mjs" . \
+            --out "$RUNNER_TEMP/cinatra-server-entry-pack/package" \
+            --esbuild-dir "$RUNNER_TEMP/cinatra-esbuild" \
+            --json
+          echo "pack_dir=$RUNNER_TEMP/cinatra-server-entry-pack/package" >> "$GITHUB_OUTPUT"
+
       # Packlist leak gate (cinatra-engineering#56). The npm tarball is the
       # DISTRIBUTION artifact crossing a trust boundary (publish-proxy →
       # registry → installer): the release FAILS here if `npm pack --dry-run
@@ -178,8 +260,12 @@ jobs:
       # purpose: a caller's SHA pin of this workflow then pins the gate's
       # rules too (no mutable side-fetch). Fail-closed: an unparsable or
       # empty pack listing also fails the release.
+      # Runs over the STAGED serverEntry build dir when one exists (that stage
+      # is what ships); otherwise over the repo root, exactly as before.
       - name: Packlist gate (no internal paths in the publish tarball)
         if: steps.gate.outputs.should_publish == 'true'
+        env:
+          PACK_DIR: ${{ steps.server_build.outputs.pack_dir || '.' }}
         run: |
           set -euo pipefail
           cat > "$RUNNER_TEMP/packlist-gate.mjs" <<'PACKLIST_GATE_EOF'
@@ -282,17 +368,23 @@ jobs:
           }
           console.log(`packlist gate OK — ${files.length} file(s), no disallowed paths.`);
           PACKLIST_GATE_EOF
-          npm pack --dry-run --json --silent > "$RUNNER_TEMP/npm-packlist.json"
+          ( cd "$PACK_DIR" && npm pack --dry-run --json --silent ) > "$RUNNER_TEMP/npm-packlist.json"
           node "$RUNNER_TEMP/packlist-gate.mjs" "$RUNNER_TEMP/npm-packlist.json"
 
+      # Packs FROM the staged serverEntry build dir when one exists (so the
+      # tarball carries the built register.mjs + the rewritten PACKED manifest);
+      # the tarball always lands in the workspace root so every downstream step
+      # (attest, submit, Release assets) keeps a single path convention.
       - name: Pack
         id: pack
         if: steps.gate.outputs.should_publish == 'true'
+        env:
+          PACK_DIR: ${{ steps.server_build.outputs.pack_dir || '.' }}
         run: |
           set -euo pipefail
-          TARBALL="$(npm pack --silent | tail -n 1)"
+          TARBALL="$( ( cd "$PACK_DIR" && npm pack --silent --pack-destination "$GITHUB_WORKSPACE" ) | tail -n 1)"
           echo "tarball=${TARBALL}" >> "$GITHUB_OUTPUT"
-          echo "Packed ${TARBALL}"
+          echo "Packed ${TARBALL} (from ${PACK_DIR})"
 
       # Build provenance for the exact published bytes. Marketplace-side
       # verification of this attestation in trusted-vendor auto-approve is a
@@ -302,18 +394,6 @@ jobs:
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: ${{ steps.pack.outputs.tarball }}
-
-      # Fetch the shared, self-contained submit tool from the org .github repo.
-      - name: Checkout submit tool
-        if: steps.gate.outputs.should_publish == 'true'
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          repository: cinatra-ai/.github
-          ref: ${{ inputs.github-repo-ref }}
-          path: .cinatra-release
-          sparse-checkout: |
-            scripts/v622/templates/release/release-submit.mjs
-          sparse-checkout-cone-mode: false
 
       # Install the two public runtime deps release-submit.mjs lazy-imports
       # (pacote + the MCP SDK). The job grants `id-token: write` (for provenance
@@ -335,7 +415,11 @@ jobs:
           # The tool is run from here in the submit step; its ESM `import` resolves
           # pacote/MCP from this dir's node_modules.
           mkdir -p "$RUNNER_TEMP/cinatra-submit"
-          cp .cinatra-release/scripts/v622/templates/release/release-submit.mjs "$RUNNER_TEMP/cinatra-submit/release-submit.mjs"
+          cp "$RUNNER_TEMP/cinatra-tools/release-submit.mjs" "$RUNNER_TEMP/cinatra-submit/release-submit.mjs"
+          # The submit tool's serverEntry preflight (packed-manifest contract,
+          # cinatra#161) lazy-imports the builder module for the shared exports
+          # resolver + artifact classifier — keep the two files siblings.
+          cp "$RUNNER_TEMP/cinatra-tools/build-server-entry.mjs" "$RUNNER_TEMP/cinatra-submit/build-server-entry.mjs"
           ( cd "$RUNNER_TEMP/cinatra-submit" && npm install --no-save --no-package-lock --ignore-scripts pacote@^21 @modelcontextprotocol/sdk@^1.29.0 )
 
       - name: Submit through the marketplace proxy (dependency-gated, source-identity-signed)

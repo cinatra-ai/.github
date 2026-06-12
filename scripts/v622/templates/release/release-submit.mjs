@@ -7,19 +7,25 @@
 // CI by installing only two public deps at runtime: pacote and
 // @modelcontextprotocol/sdk. It has NO module-load dependency (only Node
 // builtins) so it imports cleanly for unit tests; pacote + the MCP SDK are
-// lazy-imported inside the submit path.
+// lazy-imported inside the submit path, and the sibling build-server-entry.mjs
+// (shared serverEntry resolver/classifier) is lazy-imported ONLY when the
+// packed manifest declares `cinatra.serverEntry`.
 //
 // Flow:
 //   1. Read the CI-built tarball bytes.
-//   2. Derive name + version from the tarball's package.json (pacote).
-//   3. Dependency-ordering gate: every @cinatra-ai/* EXTENSION EDGE declared in the
+//   2. serverEntry preflight (cinatra#161): read the PACKED manifest from the
+//      tarball bytes; when it declares `cinatra.serverEntry`, the resolved entry
+//      must be a BUILT, present, Node-importable artifact (the runtime package
+//      store refuses anything else at install time) — refuse to submit otherwise.
+//   3. Derive name + version from the tarball's package.json (pacote).
+//   4. Dependency-ordering gate: every @cinatra-ai/* EXTENSION EDGE declared in the
 //      manifest's canonical `cinatra.dependencies` must already be present on
 //      registry.cinatra.ai (the authenticated install-backend) — which happens by
 //      publishing it THROUGH the marketplace, never by direct registry publish —
 //      fail BEFORE submit otherwise. Host-internal SDK/app peers are host-provided
 //      under model-B and are SKIPPED (never on the registry).
-//   4. sha256 + size; base64.
-//   5. Call `cinatra-extension-submit-for-review` over MCP with the exact bytes.
+//   5. sha256 + size; base64.
+//   6. Call `cinatra-extension-submit-for-review` over MCP with the exact bytes.
 //
 // Token: CINATRA_MARKETPLACE_VENDOR_TOKEN (the submit-scope GitHub org secret).
 //
@@ -38,6 +44,7 @@ import { readFile } from "node:fs/promises";
 import { resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
+import { gunzipSync } from "node:zlib";
 
 export const CINATRA_SCOPE = "@cinatra-ai/";
 export const DEFAULT_REGISTRY_URL = "https://registry.cinatra.ai";
@@ -248,6 +255,201 @@ export async function assertDependencyOrdering(opts) {
   return report;
 }
 
+// --- packed-manifest serverEntry preflight (cinatra#161 §4.2) -----------------
+// The Cinatra runtime package store is BUILT-ARTIFACTS-ONLY: a package that
+// declares `cinatra.serverEntry` must resolve it — through the package `exports`
+// map under the pinned Cinatra resolver semantics, else as a literal path — to
+// an EXISTING regular file with a Node-importable extension (.mjs/.cjs/.js).
+// The host materializer refuses every other shape at install time, so submitting
+// a source-mirror tarball would only mint a marketplace listing nobody can
+// install. This preflight is the EARLIEST fail-loud: it reads the PACKED
+// manifest from the tarball BYTES (never a source tree — the release build step
+// rewrites the manifest in the staged pack dir only) and refuses to submit a
+// violating tarball. Zero-dependency: a minimal USTAR walk over the gunzipped
+// bytes (node builtins only); the resolver/classifier semantics are imported
+// from the sibling build-server-entry.mjs (the byte-synced placement copy of
+// the canonical cinatra-monorepo builder) ONLY when a serverEntry is declared,
+// so this file still imports/runs standalone for every serverEntry-less
+// extension (agents, skills, artifacts, workflows).
+
+/**
+ * Minimal USTAR reader for an npm tarball. Returns the gunzipped buffer and
+ * every entry header `{ name, size, typeflag, dataStart }`. Handles the
+ * ustar prefix field; pax/longname meta entries are walked over (their data
+ * blocks are skipped correctly) — npm tarball member paths relevant to this
+ * preflight (`package/package.json`, the resolved serverEntry) are short.
+ */
+export function listTarEntries(tarballBytes) {
+  const tar = gunzipSync(tarballBytes);
+  const entries = [];
+  let off = 0;
+  while (off + 512 <= tar.length) {
+    const block = tar.subarray(off, off + 512);
+    if (block.every((b) => b === 0)) break; // end-of-archive marker
+    const cstr = (from, to) => {
+      const slice = block.subarray(from, to);
+      const nul = slice.indexOf(0);
+      return slice.subarray(0, nul === -1 ? slice.length : nul).toString("utf8");
+    };
+    const nameRaw = cstr(0, 100);
+    const prefix = cstr(345, 500);
+    const size = Number.parseInt(cstr(124, 136).trim() || "0", 8);
+    if (!Number.isFinite(size) || size < 0) {
+      throw new Error("listTarEntries: malformed tar header (size field) — refusing to parse");
+    }
+    const typeflag = block[156] === 0 ? "0" : String.fromCharCode(block[156]);
+    entries.push({
+      name: prefix ? `${prefix}/${nameRaw}` : nameRaw,
+      size,
+      typeflag,
+      dataStart: off + 512,
+    });
+    off += 512 + Math.ceil(size / 512) * 512;
+  }
+  return { tar, entries };
+}
+
+/**
+ * Read the PACKED package.json from tarball bytes (npm pack prefixes every
+ * member with `package/`) plus the set of regular-file member paths.
+ *
+ * FAIL-CLOSED tar semantics: a hand-crafted tarball
+ * could shadow members (duplicate paths extract last-wins in npm/node-tar,
+ * while a naive reader sees the first) or rename them via pax/GNU extended
+ * headers — either would let the EFFECTIVE package diverge from what this
+ * preflight inspected. npm pack emits neither (plain ustar names, prefix
+ * splitting, no duplicates), so both shapes are refused outright instead of
+ * being interpreted.
+ */
+export function readPackedManifest(tarballBytes) {
+  const { tar, entries } = listTarEntries(tarballBytes);
+  const extended = entries.find((e) => ["x", "g", "L", "K"].includes(e.typeflag));
+  if (extended) {
+    throw new Error(
+      `tarball carries an extended tar header (typeflag "${extended.typeflag}") — refusing: the ` +
+        "preflight requires plain ustar member names (which npm pack produces); extended headers " +
+        "can rename members after inspection",
+    );
+  }
+  // Canonical-names-only + duplicate check across ALL member types: a later
+  // symlink/hardlink with a regular member's path, or a non-canonical alias
+  // of it ("package/./register.mjs",
+  // "package//register.mjs", absolute, ".." traversal), would extract
+  // last-wins and shadow the inspected bytes. npm pack emits canonical,
+  // duplicate-free names — anything else is refused, never interpreted.
+  const seen = new Set();
+  for (const e of entries) {
+    const segments = e.name.split("/");
+    // Tolerate exactly one trailing "/" (directory-entry convention).
+    if (segments.length > 1 && segments[segments.length - 1] === "") segments.pop();
+    if (e.name.startsWith("/") || segments.some((s) => s === "" || s === "." || s === "..")) {
+      throw new Error(
+        `tarball member "${e.name}" has a non-canonical path — refusing: aliased paths extract ` +
+          "onto canonical ones last-wins and would shadow the bytes this preflight inspected",
+      );
+    }
+    const canonical = segments.join("/");
+    if (seen.has(canonical)) {
+      throw new Error(
+        `tarball has a duplicate member "${e.name}" — refusing: duplicate paths extract last-wins ` +
+          "and would shadow the bytes this preflight inspected",
+      );
+    }
+    seen.add(canonical);
+  }
+  const files = entries.filter((e) => e.typeflag === "0");
+  const manifestEntry = files.find((e) => e.name === "package/package.json");
+  if (!manifestEntry) {
+    throw new Error("tarball carries no package/package.json — not an npm package tarball");
+  }
+  let manifest;
+  try {
+    manifest = JSON.parse(
+      tar.subarray(manifestEntry.dataStart, manifestEntry.dataStart + manifestEntry.size).toString("utf8"),
+    );
+  } catch (err) {
+    throw new Error(`tarball package/package.json is not valid JSON: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  return { manifest, fileNames: new Set(files.map((e) => e.name)) };
+}
+
+/**
+ * PURE serverEntry-contract check over a packed manifest + tarball file set.
+ * Resolver/classifier are dependency-injected (the builder module's exports) so
+ * this is unit-testable and the semantics live in exactly one placement file.
+ * Returns null when the contract holds (or no serverEntry is declared), else a
+ * violation message.
+ */
+export function packedServerEntryViolation(
+  { manifest, fileNames },
+  { resolveDeclaredServerEntry, classifyServerEntryArtifact },
+) {
+  const serverEntry =
+    manifest?.cinatra && typeof manifest.cinatra.serverEntry === "string"
+      ? manifest.cinatra.serverEntry
+      : null;
+  if (!serverEntry) return null; // no-server-entry package — valid as-is
+  const resolution = resolveDeclaredServerEntry(manifest.exports, serverEntry);
+  if (resolution.kind !== "resolved") {
+    return (
+      `cinatra.serverEntry "${serverEntry}" is a declared exports key whose target is outside the ` +
+      `supported exports forms (exact key → "./"-relative string, or a one-level conditional whose ` +
+      `import/default/require value is such a string) — the runtime store refuses this shape`
+    );
+  }
+  const rel = resolution.rel;
+  const cleaned = rel.replace(/^\.\//, "");
+  // Same segment-level guard the host store and the builder apply: absolute
+  // paths and ANY ".." segment are refused.
+  if (cleaned.startsWith("/") || cleaned.split("/").some((seg) => seg === "..")) {
+    return `cinatra.serverEntry "${serverEntry}" resolves to "${rel}" — escapes the package dir`;
+  }
+  const cls = classifyServerEntryArtifact(rel);
+  if (cls !== "importable") {
+    return (
+      `cinatra.serverEntry "${serverEntry}" resolves to "${rel}" — ` +
+      `${cls === "source" ? "TypeScript source" : "not a concrete importable file"}. ` +
+      `The runtime store activates BUILT artifacts only (.mjs/.cjs/.js)`
+    );
+  }
+  if (!fileNames.has(`package/${cleaned}`)) {
+    return `cinatra.serverEntry "${serverEntry}" resolves to "${rel}" but the tarball carries no such file`;
+  }
+  return null;
+}
+
+/**
+ * Effectful preflight wrapper: parse the tarball bytes, lazy-import the sibling
+ * builder module for the shared resolver/classifier (only when a serverEntry is
+ * actually declared), and throw an actionable error on any violation.
+ */
+export async function assertPackedServerEntryContract(tarballBytes) {
+  const { manifest, fileNames } = readPackedManifest(tarballBytes);
+  const declares =
+    manifest?.cinatra && typeof manifest.cinatra.serverEntry === "string";
+  if (!declares) return { ok: true, serverEntry: null };
+  let builder;
+  try {
+    builder = await import(new URL("./build-server-entry.mjs", import.meta.url).href);
+  } catch {
+    throw new Error(
+      "serverEntry preflight needs build-server-entry.mjs next to release-submit.mjs (it provides the " +
+        "shared exports resolver + artifact classifier). Ship the two files side by side — the reusable " +
+        "release workflow stages them together.",
+    );
+  }
+  const violation = packedServerEntryViolation({ manifest, fileNames }, builder);
+  if (violation) {
+    throw new Error(
+      `serverEntry preflight FAILED — refusing to submit ${manifest.name ?? "?"}: ${violation}. ` +
+        `Publish a BUILT entry: the release pipeline's build step (build-server-entry.mjs) turns the ` +
+        `in-tree source shape (exports["./register"] → "./src/register.ts") into a bundled top-level ` +
+        `register.mjs with cinatra.serverEntry "./register.mjs" in the PACKED manifest (cinatra#161).`,
+    );
+  }
+  return { ok: true, serverEntry: manifest.cinatra.serverEntry };
+}
+
 // Assemble the exact `cinatra-extension-submit-for-review` MCP arguments. Kept a
 // pure, exported function so the wire shape is unit-testable without pacote/MCP.
 // Optional fields are emitted ONLY when meaningfully present, so a submit with no
@@ -284,6 +486,10 @@ export function buildSubmitArguments({
 // --- marketplace submit (lazy heavy imports) ---------------------------------
 async function submitTarball({ tarballPath, description, skipDependencyCheck }) {
   const tarballBytes = await readFile(tarballPath);
+  // Earliest fail-loud (cinatra#161 §4.2): never submit a tarball whose PACKED
+  // manifest declares a runtime-store-uninstallable serverEntry shape. Reads
+  // the manifest from the tarball BYTES — the same bytes the marketplace gets.
+  await assertPackedServerEntryContract(tarballBytes);
   const { default: pacote } = await import("pacote");
   const manifest = await pacote.manifest(`file:${tarballPath}`);
   if (typeof manifest.name !== "string" || manifest.name.indexOf("/") < 0) {
