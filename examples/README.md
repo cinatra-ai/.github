@@ -56,11 +56,18 @@ The reusable workflow requires one org secret:
 |--------|-------|---------|
 | **`CINATRA_MARKETPLACE_VENDOR_TOKEN`** | submit-only | Authenticates the `cinatra-extension-submit-for-review` MCP call. **Submit scope only** — never an admin-approve token, never a Verdaccio-publish token. |
 
-Optional (only while `registry.cinatra.ai` public-read is not yet enabled):
+The dependency-ordering gate needs **no** registry secret: the caller grants
+`id-token: write` (already in `examples/release.yml`) and the gate mints a GitHub
+Actions OIDC token (`aud=https://marketplace.cinatra.ai`) to verify the
+`@cinatra-ai/*` closure through the OIDC-gated ability
+`cinatra/extension-dependency-exists` (broker-mediated). It never reads the
+registry directly.
+
+Deprecated/unused:
 
 | Secret | Scope | Purpose |
 |--------|-------|---------|
-| `CINATRA_REGISTRY_TOKEN` | read-only | Lets the dependency-ordering gate read the `@cinatra-ai/*` closure on the registry. |
+| `CINATRA_REGISTRY_TOKEN` | read-only | **Deprecated/unused.** The gate no longer reads `registry.cinatra.ai` directly — it goes through the OIDC-gated marketplace ability. Safe to drop; kept (optional) only so existing callers that still pass it do not error. |
 
 Set them at **Org → Settings → Secrets and variables → Actions → New organization
 secret**, and under **Repository access** choose **Selected repositories** — add

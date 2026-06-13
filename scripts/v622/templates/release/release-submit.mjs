@@ -19,25 +19,39 @@
 //      store refuses anything else at install time) — refuse to submit otherwise.
 //   3. Derive name + version from the tarball's package.json (pacote).
 //   4. Dependency-ordering gate: every @cinatra-ai/* EXTENSION EDGE declared in the
-//      manifest's canonical `cinatra.dependencies` must already be present on
-//      registry.cinatra.ai (the authenticated install-backend) — which happens by
-//      publishing it THROUGH the marketplace, never by direct registry publish —
-//      fail BEFORE submit otherwise. Host-internal SDK/app peers are host-provided
-//      under model-B and are SKIPPED (never on the registry).
+//      manifest's canonical `cinatra.dependencies` must already be PUBLISHED — which
+//      happens by publishing it THROUGH the marketplace, never by direct registry
+//      publish — fail BEFORE submit otherwise. Existence is determined by the
+//      deployed, OIDC-gated marketplace ability `cinatra/extension-dependency-exists`
+//      (broker-mediated): registry.cinatra.ai reads are ACL-gated to the install-broker
+//      and the broker's read token is, by design, NOT in GitHub Actions, so the gate
+//      cannot read the registry directly (a direct GET 401s in CI). Instead the gate
+//      presents the GitHub Actions OIDC identity token (aud=marketplace) and the
+//      ability returns ONLY booleans through the broker. Host-internal SDK/app peers
+//      are host-provided under model-B and are SKIPPED (never declared as an edge).
 //   5. sha256 + size; base64.
 //   6. Call `cinatra-extension-submit-for-review` over MCP with the exact bytes.
 //
-// Token: CINATRA_MARKETPLACE_VENDOR_TOKEN (the submit-scope GitHub org secret).
+// Tokens: CINATRA_MARKETPLACE_VENDOR_TOKEN (the submit-scope GitHub org secret, for
+// the submit MCP call) and CINATRA_DEP_GATE_IDENTITY_TOKEN (a GitHub Actions OIDC
+// token, aud=marketplace, minted by the reusable workflow for the dependency-gate
+// ability call — see below).
 //
 // Gate scope vs. the dev CLI: this portable gate is EXISTENCE-based — it asks
-// "is every @cinatra-ai/* EXTENSION EDGE (cinatra.dependencies) published on the
-// registry at all?", which is the ordering guarantee that matters (a public repo
-// can't install an unpublished sibling extension). It deliberately does NOT do
-// semver range-satisfaction; the marketplace
-// re-validates exact version compatibility at approval, and the dev-side
-// packages/cli/src/extensions-dependency-gate.mjs adds the semver-aware check for
-// local use. Keep the 401-vs-404 classification below in lock-step with that
-// module.
+// "is every @cinatra-ai/* EXTENSION EDGE (cinatra.dependencies) published at all?",
+// which is the ordering guarantee that matters (a public repo can't install an
+// unpublished sibling extension). It deliberately does NOT do semver
+// range-satisfaction; the marketplace re-validates exact version compatibility at
+// approval, and the dev-side packages/cli/src/extensions-dependency-gate.mjs adds
+// the semver-aware check for local use.
+//
+// FAIL-CLOSED: the gate is the ordering guarantee, so EVERY auth/availability error
+// is fatal and is NEVER allowed to read as "missing+pass" or to silently pass. A
+// `false` from the ability => missing (a real ordering violation); an absent token,
+// a 401/403/502 from the ability, an MCP transport error, or any ambiguous/partial/
+// non-boolean result => fatal. The only escape hatch is the explicit
+// `--skip-dependency-check` flag (manual/local backfill where the closure is
+// independently known-published).
 // ---------------------------------------------------------------------------
 
 import { readFile } from "node:fs/promises";
@@ -47,18 +61,45 @@ import { createHash } from "node:crypto";
 import { gunzipSync } from "node:zlib";
 
 export const CINATRA_SCOPE = "@cinatra-ai/";
+// Canonical install-backend registry URL. The dependency-ordering gate no longer
+// reads it DIRECTLY (the broker-mediated ability owns the registry read — see the
+// gate below), but it is kept as the canonical constant the dev-side semver gate
+// (packages/cli/src/extensions-dependency-gate.mjs) shares for parity.
 export const DEFAULT_REGISTRY_URL = "https://registry.cinatra.ai";
 export const MARKETPLACE_BASE_URL = "https://marketplace.cinatra.ai";
 const MCP_ROUTE = "/wp-json/cinatra/mcp";
+// The deployed dependency-existence ability is registered as the WP ability
+// `cinatra/extension-dependency-exists`; the MCP adapter exposes it as the tool
+// name below (the WP ability id with `/`→`-`, the same convention by which
+// `cinatra/extension-submit-for-review` is called as
+// `cinatra-extension-submit-for-review`).
+export const DEP_EXISTS_TOOL_NAME = "cinatra-extension-dependency-exists";
+// The deployed ability caps a batch at 64 names (one single-use OIDC jti
+// authenticates exactly one batched call). A manifest declaring more first-party
+// extension edges than this is implausible — but the gate must FAIL CLOSED with a
+// clear error rather than silently truncate (which could let an unprobed,
+// unpublished edge slip through the ordering guarantee).
+export const DEP_EXISTS_MAX_NAMES = 64;
+// Strict first-party scoped-name shape, mirroring the deployed ability's
+// NAME_PATTERN exactly. A declared edge that does not match is an authoring error;
+// the gate refuses it (fail-closed) instead of sending an ambiguous name.
+export const DEP_NAME_PATTERN = /^@cinatra-ai\/[a-z0-9][a-z0-9_.-]*$/;
 // The submit MCP call runs the promotion saga INLINE (stage-publish → final-publish →
 // verify-digest → storefront read-back), which can exceed the MCP SDK's 60s default
 // request timeout under rate-limit backoff or registry/WooCommerce slowness. Use a
 // generous explicit timeout so a slow-but-succeeding publish is never falsely reported
 // as a failure. Override via CINATRA_SUBMIT_TIMEOUT_MS.
 const SUBMIT_TIMEOUT_MS = Number(process.env.CINATRA_SUBMIT_TIMEOUT_MS || 600_000);
+// The dependency-existence ability is a cheap broker-mediated read (no saga). A
+// modest explicit timeout fails fast; on timeout/transport failure the gate does NOT
+// retry — the OIDC token's single-use jti may already have been consumed server-side,
+// so a retry would need a freshly minted token. Override via CINATRA_DEP_GATE_TIMEOUT_MS.
+const DEP_GATE_TIMEOUT_MS = Number(process.env.CINATRA_DEP_GATE_TIMEOUT_MS || 60_000);
 
-// --- dependency-ordering gate (existence-based; mirror of the 401-vs-404
-//     classification in packages/cli/src/extensions-dependency-gate.mjs) -------
+// --- dependency-ordering gate (existence-based; the @cinatra-ai/* extension-edge
+//     SELECTION mirrors packages/cli/src/extensions-dependency-gate.mjs; existence
+//     itself is now resolved via the broker-mediated marketplace ability — boolean
+//     result vs fatal ability error — not a direct registry 401-vs-404 probe) -----
 export function extractCinatraDeps(manifest) {
   const out = [];
   const seen = new Set();
@@ -127,18 +168,13 @@ export function selectExtensionDepsToProbe(manifest) {
   return { toProbe, skippedNonManifestCinatraDeps };
 }
 
-function authHeader(token) {
-  if (!token) return {};
-  return { authorization: /^(Bearer|Basic)\s/i.test(token) ? token : `Bearer ${token}` };
-}
-
 // Vendor SUBMIT auth (the marketplace MCP). CINATRA_MARKETPLACE_VENDOR_TOKEN may be
 // a full "Basic …"/"Bearer …" header OR a RAW WordPress application password (what
 // the wp-admin UI / Infisical hold). For a raw value, build HTTP Basic
 // base64("<vendor-user>:<app-pw>") — WP application-password auth; the user defaults
 // to the first-party vendor `cinatra-ai` (override via CINATRA_MARKETPLACE_VENDOR_USER).
-// (The registry probe keeps authHeader()'s Bearer-by-default — that token is a
-// registry read token, not a WP app-password.)
+// (The dependency-ordering gate does NOT use this: it authenticates per-call with a
+// GitHub Actions OIDC token in the ability's request BODY, not a transport header.)
 export function vendorAuthHeader(token) {
   if (!token) return {};
   if (/^(Bearer|Basic)\s/i.test(token)) return { authorization: token };
@@ -185,47 +221,171 @@ export function assertSubmissionOutcome({ submissionId, status, promotionState }
   return outcome;
 }
 
-export async function probeDep(dep, { registryUrl, token, fetchImpl }) {
-  const url = `${String(registryUrl).replace(/\/+$/, "")}/${dep.name.replace("/", "%2F")}`;
-  let res;
-  try {
-    res = await fetchImpl(url, { headers: { accept: "application/json", ...authHeader(token) } });
-  } catch (err) {
-    return { ...dep, state: "error", detail: err instanceof Error ? err.message : String(err) };
-  }
-  if (res.status === 401 || res.status === 403) return { ...dep, state: "unreadable", status: res.status };
-  if (res.status === 404) return { ...dep, state: "missing", status: 404, detail: "not found on the registry" };
-  if (!res.ok) return { ...dep, state: "error", status: res.status, detail: `unexpected HTTP ${res.status}` };
-  let body;
-  try {
-    body = await res.json();
-  } catch {
-    return { ...dep, state: "error", detail: "registry returned a non-JSON packument" };
-  }
-  const versions = Object.keys(body?.versions ?? {});
-  return versions.length > 0
-    ? { ...dep, state: "satisfied" }
-    : { ...dep, state: "missing", detail: "no published versions" };
+// PURE per-edge classifier over a name→boolean existence map (NOT a transport).
+// The boolean map is produced by the broker-mediated ability (see
+// lookupExtensionExistence) and injected, so this stays unit-testable with no MCP.
+//   exists[dep.name] === true  → satisfied (published)
+//   exists[dep.name] === false → missing (a real ordering violation)
+// A name absent from the map, or a non-boolean value, is a CONTRACT VIOLATION and
+// is classified `error` (fatal) — never read as "missing+pass". When the whole
+// batched lookup throws, the caller poisons EVERY edge with `unreadable` instead
+// of calling this (so the report shape is preserved and no edge silently vanishes).
+export function classifyDepExistence(dep, exists) {
+  const v = exists instanceof Map ? exists.get(dep.name) : exists?.[dep.name];
+  if (v === true) return { ...dep, state: "satisfied" };
+  if (v === false) return { ...dep, state: "missing", detail: "not published (the marketplace ability returned false)" };
+  return {
+    ...dep,
+    state: "error",
+    detail: "the marketplace ability returned no boolean for this name (contract violation)",
+  };
 }
 
-export async function checkDependencyOrdering({
-  manifest,
-  registryUrl = DEFAULT_REGISTRY_URL,
-  token,
-  fetchImpl = globalThis.fetch,
-} = {}) {
-  if (typeof fetchImpl !== "function") throw new Error("checkDependencyOrdering: no fetch implementation available");
-  // Probe ONLY canonical extension edges (cinatra.dependencies); host-internal
-  // @cinatra-ai/* peers are host-provided under model-B and never on the registry.
+// Effectful batched existence lookup THROUGH the deployed, OIDC-gated marketplace
+// ability `cinatra/extension-dependency-exists`. Sends ALL `names` in ONE call (the
+// ability batches; one single-use OIDC jti authenticates one call). Returns a
+// Map name→boolean. FAIL-CLOSED: THROWS on a missing token, an MCP error, a
+// malformed/partial result, an unexpected extra name, or any non-boolean value —
+// the caller treats a throw as fatal for the whole gate.
+//
+// `callToolImpl(toolName, args, { timeoutMs })` is injected so the production MCP
+// path and the unit tests share one classifier/validator. It must resolve to the
+// MCP tool result `{ isError?, structuredContent?, content? }`.
+export async function lookupExtensionExistence(
+  names,
+  { identityToken, callToolImpl, toolName = DEP_EXISTS_TOOL_NAME, timeoutMs = DEP_GATE_TIMEOUT_MS } = {},
+) {
+  if (typeof callToolImpl !== "function") {
+    throw new Error("lookupExtensionExistence: no callTool implementation available");
+  }
+  if (typeof identityToken !== "string" || identityToken === "") {
+    throw new Error(
+      "dependency-ordering gate: no GitHub Actions OIDC identity token available " +
+        "(CINATRA_DEP_GATE_IDENTITY_TOKEN unset) — the broker-mediated existence ability " +
+        "requires it. Refusing to verify (fail-closed); the ordering guarantee cannot hold without it.",
+    );
+  }
+  // Defensive batch validation (mirrors the deployed ability) BEFORE any call so a
+  // malformed/oversized batch fails closed with a clear local error.
+  if (!Array.isArray(names) || names.length === 0) {
+    throw new Error("lookupExtensionExistence: at least one name is required.");
+  }
+  const unique = [...new Set(names)];
+  if (unique.length !== names.length) {
+    throw new Error("lookupExtensionExistence: duplicate names in the batch (refusing to send an ambiguous batch).");
+  }
+  if (unique.length > DEP_EXISTS_MAX_NAMES) {
+    throw new Error(
+      `dependency-ordering gate: ${unique.length} first-party extension edges exceeds the ability's ` +
+        `batch cap of ${DEP_EXISTS_MAX_NAMES}. Refusing to verify (fail-closed) rather than truncate.`,
+    );
+  }
+  for (const n of unique) {
+    if (typeof n !== "string" || !DEP_NAME_PATTERN.test(n)) {
+      throw new Error(
+        `dependency-ordering gate: declared extension edge "${n}" is not a valid first-party ` +
+          `"@cinatra-ai/<ext>" name. Fix cinatra.dependencies; refusing to verify (fail-closed).`,
+      );
+    }
+  }
+
+  let result;
+  try {
+    result = await callToolImpl(toolName, { source_identity_token: identityToken, names: unique }, { timeoutMs });
+  } catch (err) {
+    // Transport/timeout/protocol error. Do NOT retry with the same token (its jti
+    // may already be consumed server-side); surface as fatal.
+    throw new Error(
+      `dependency-ordering gate: the marketplace ability "${toolName}" call failed: ` +
+        (err instanceof Error ? err.message : String(err)),
+    );
+  }
+  if (result?.isError) {
+    const txt = Array.isArray(result.content) ? result.content.find((c) => c.type === "text")?.text : null;
+    // A 401/403 (unverifiable caller) or 502 (broker existence read failed) lands
+    // here — all fatal. The ability NEVER returns a partial/ambiguous success.
+    throw new Error(`dependency-ordering gate: the marketplace ability "${toolName}" returned an error: ${txt ?? "unknown"}`);
+  }
+  const out = result?.structuredContent ?? {};
+  const map = out.results;
+  if (map == null || typeof map !== "object" || Array.isArray(map)) {
+    throw new Error(`dependency-ordering gate: the marketplace ability "${toolName}" returned no usable results map.`);
+  }
+  const lookup = new Map();
+  for (const n of unique) {
+    if (!Object.prototype.hasOwnProperty.call(map, n)) {
+      throw new Error(`dependency-ordering gate: the ability omitted "${n}" from its results (partial/ambiguous — fail-closed).`);
+    }
+    const v = map[n];
+    if (typeof v !== "boolean") {
+      throw new Error(`dependency-ordering gate: the ability returned a non-boolean for "${n}" (contract violation — fail-closed).`);
+    }
+    lookup.set(n, v);
+  }
+  // Reject contract drift: any name the ability returned that we did NOT ask for.
+  for (const k of Object.keys(map)) {
+    if (!lookup.has(k)) {
+      throw new Error(`dependency-ordering gate: the ability returned an unrequested name "${k}" (contract drift — fail-closed).`);
+    }
+  }
+  return lookup;
+}
+
+// Verify the @cinatra-ai/* dependency-ordering closure via the broker-mediated
+// existence ability. `existsLookup(names) => Promise<Map name→boolean>` is injected
+// (production wires it to lookupExtensionExistence over MCP; tests inject a stub).
+// Probes ONLY canonical extension edges (cinatra.dependencies); host-internal
+// @cinatra-ai/* peers are host-provided under model-B and intentionally never on
+// the registry, so they are SKIPPED. FAIL-CLOSED: a lookup throw poisons EVERY
+// probed edge as `unreadable` (fatal) so the report shape is intact and no edge
+// silently disappears.
+export async function checkDependencyOrdering({ manifest, existsLookup } = {}) {
   const { toProbe: deps, skippedNonManifestCinatraDeps } = selectExtensionDepsToProbe(manifest);
-  const results = [];
-  for (const dep of deps) results.push(await probeDep(dep, { registryUrl, token, fetchImpl }));
+  let results;
+  if (deps.length === 0) {
+    // 0-dep manifest: nothing to verify, no token required, no ability call — and
+    // no existsLookup needed (checked only when there are edges to probe).
+    results = [];
+  } else {
+    if (typeof existsLookup !== "function") {
+      throw new Error("checkDependencyOrdering: no existence-lookup implementation available");
+    }
+    const names = deps.map((d) => d.name);
+    let lookup;
+    try {
+      lookup = await existsLookup(names);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      // Poison every edge — a single lookup failure must fail the WHOLE gate.
+      results = deps.map((d) => ({ ...d, state: "unreadable", detail }));
+      const errored = [];
+      const missing = [];
+      const unreadable = results;
+      return {
+        ok: false,
+        deps,
+        skippedNonManifestCinatraDeps,
+        results,
+        missing,
+        unreadable,
+        errored,
+        satisfied: [],
+        lookupError: detail,
+      };
+    }
+    results = deps.map((d) => classifyDepExistence(d, lookup));
+  }
   const missing = results.filter((r) => r.state === "missing");
   const unreadable = results.filter((r) => r.state === "unreadable");
   const errored = results.filter((r) => r.state === "error");
   return {
     ok: missing.length === 0 && unreadable.length === 0 && errored.length === 0,
-    registryUrl, deps, skippedNonManifestCinatraDeps, results, missing, unreadable, errored,
+    deps,
+    skippedNonManifestCinatraDeps,
+    results,
+    missing,
+    unreadable,
+    errored,
     satisfied: results.filter((r) => r.state === "satisfied"),
   };
 }
@@ -233,17 +393,21 @@ export async function checkDependencyOrdering({
 export function formatGateFailure(report) {
   const lines = [];
   if (report.missing.length > 0) {
-    lines.push(`Dependency-ordering gate FAILED — ${report.missing.length} @cinatra-ai/* dependency(ies) not on ${report.registryUrl}:`);
+    lines.push(`Dependency-ordering gate FAILED — ${report.missing.length} @cinatra-ai/* dependency(ies) not yet published:`);
     for (const m of report.missing) lines.push(`  • ${m.name}@${m.range} [${m.field}] — ${m.detail || "missing"}`);
     lines.push("Publish the missing @cinatra-ai/* dependency extension(s) (in dependency order) THROUGH the marketplace storefront FIRST, then re-submit. (These are dependency extensions, not the host SDK.)");
   }
   if (report.unreadable.length > 0) {
-    lines.push(`Dependency-ordering gate could NOT verify — ${report.registryUrl} returned ${report.unreadable[0].status} (registry not readable):`);
+    lines.push(`Dependency-ordering gate could NOT verify via the marketplace existence ability (${report.lookupError || "unverifiable"}):`);
     for (const u of report.unreadable) lines.push(`  • ${u.name}@${u.range} [${u.field}]`);
-    lines.push("registry.cinatra.ai requires authentication by design — export a read-scope CINATRA_REGISTRY_TOKEN, then re-run. (Use --skip-dependency-check only if you have independently confirmed the closure is published.)");
+    lines.push(
+      "The broker-mediated ability requires a GitHub Actions OIDC identity token (aud=marketplace) and a verifiable, public, first-party caller. " +
+        "In CI it is minted by the reusable release workflow (CINATRA_DEP_GATE_IDENTITY_TOKEN); a missing/rejected token or an ability/broker error is fatal by design. " +
+        "(Use --skip-dependency-check only for manual/local backfill where you have independently confirmed the closure is published.)",
+    );
   }
   if (report.errored.length > 0) {
-    lines.push(`Dependency-ordering gate hit ${report.errored.length} registry error(s):`);
+    lines.push(`Dependency-ordering gate hit ${report.errored.length} ability error(s):`);
     for (const e of report.errored) lines.push(`  • ${e.name}@${e.range}: ${e.detail || `HTTP ${e.status}`}`);
   }
   return lines.join("\n");
@@ -483,6 +647,29 @@ export function buildSubmitArguments({
   return args;
 }
 
+// --- shared MCP connection helper --------------------------------------------
+// Open a short-lived MCP client (lazy heavy imports) against the marketplace MCP
+// route, hand a `callTool(name, args, { timeoutMs })` to `fn`, and ALWAYS close the
+// connection. Used for the dependency-gate ability call (no transport auth header —
+// the OIDC token rides in the call body). `headers` lets a caller add transport auth
+// when needed (the submit path supplies the vendor Basic header).
+async function withMcpCallTool({ baseUrl, headers = {}, clientName }, fn) {
+  const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+  const { StreamableHTTPClientTransport } = await import("@modelcontextprotocol/sdk/client/streamableHttp.js");
+  const transport = new StreamableHTTPClientTransport(new URL(baseUrl + MCP_ROUTE), {
+    requestInit: { headers },
+  });
+  const client = new Client({ name: clientName, version: "1.0.0" });
+  await client.connect(transport);
+  try {
+    const callTool = (name, args, { timeoutMs } = {}) =>
+      client.callTool({ name, arguments: args }, undefined, timeoutMs != null ? { timeout: timeoutMs } : undefined);
+    return await fn(callTool);
+  } finally {
+    await client.close().catch(() => {});
+  }
+}
+
 // --- marketplace submit (lazy heavy imports) ---------------------------------
 async function submitTarball({ tarballPath, description, skipDependencyCheck }) {
   const tarballBytes = await readFile(tarballPath);
@@ -502,8 +689,20 @@ async function submitTarball({ tarballPath, description, skipDependencyCheck }) 
   if (!version) throw new Error("Tarball package.json is missing a `version` field.");
 
   if (!skipDependencyCheck) {
-    const registryUrl = (process.env.CINATRA_REGISTRY_URL || DEFAULT_REGISTRY_URL).trim();
-    const report = await assertDependencyOrdering({ manifest, registryUrl, token: process.env.CINATRA_REGISTRY_TOKEN });
+    const baseUrl = (process.env.MARKETPLACE_BASE_URL || MARKETPLACE_BASE_URL).replace(/\/+$/, "");
+    // OIDC identity token (aud=marketplace) for the broker-mediated existence
+    // ability. Minted by the reusable release workflow as a SEPARATE token from the
+    // submit step's CINATRA_SOURCE_IDENTITY_TOKEN — the ability consumes a single-use
+    // jti per call, so the gate must not share the submit token. An empty value here
+    // means the gate will fail closed inside lookupExtensionExistence (NOT skip) —
+    // the ordering guarantee cannot hold without a verifiable caller.
+    const identityToken = process.env.CINATRA_DEP_GATE_IDENTITY_TOKEN;
+    const existsLookup = (names) =>
+      withMcpCallTool(
+        { baseUrl, headers: {}, clientName: "cinatra-release-dep-gate" },
+        (callTool) => lookupExtensionExistence(names, { identityToken, callToolImpl: callTool }),
+      );
+    const report = await assertDependencyOrdering({ manifest, existsLookup });
     const skipped = report?.skippedNonManifestCinatraDeps ?? [];
     if (skipped.length > 0) {
       process.stderr.write(
