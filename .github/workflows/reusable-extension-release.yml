@@ -9,7 +9,12 @@
 #
 # Prerequisites (see examples/README.md):
 #   - CINATRA_MARKETPLACE_VENDOR_TOKEN is set as a GitHub org secret (submit scope)
-#   - registry.cinatra.ai public-read is enabled (or CINATRA_REGISTRY_TOKEN is set)
+#   - The job grants `id-token: write` so the dependency-ordering gate can mint a
+#     GitHub Actions OIDC token (aud=marketplace) for the broker-mediated existence
+#     ability `cinatra/extension-dependency-exists`. No registry read token is needed:
+#     registry reads are ACL-gated to the install-broker (its token is, by design,
+#     NOT in Actions) and the gate goes through the OIDC-authed ability, never a
+#     direct registry GET. (CINATRA_REGISTRY_TOKEN is deprecated/unused here.)
 #
 # Flow: build the CI artifact from a clean checkout → serverEntry build stage
 # (cinatra#161: a manifest declaring `cinatra.serverEntry` gets its entry
@@ -46,7 +51,7 @@ on:
         description: "Submit-scope marketplace vendor token (the GitHub org secret)."
         required: true
       CINATRA_REGISTRY_TOKEN:
-        description: "Optional read-scope registry token (unneeded after the public-read flip)."
+        description: "DEPRECATED/UNUSED. The dependency-ordering gate now verifies existence through the OIDC-gated marketplace ability (cinatra/extension-dependency-exists), not a direct registry read. Kept (optional) only so existing callers that still pass it do not error; safe to drop."
         required: false
 
 jobs:
@@ -54,7 +59,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write       # OIDC — provenance attestation AND source-identity token mint
+      id-token: write       # OIDC — provenance attestation AND the dependency-gate + source-identity token mints
       attestations: write   # provenance attestation
     outputs:
       should_publish: ${{ steps.gate.outputs.should_publish }}
@@ -434,13 +439,13 @@ jobs:
 
       # Install the two public runtime deps release-submit.mjs lazy-imports
       # (pacote + the MCP SDK). The job grants `id-token: write` (for provenance
-      # AND the source-identity mint below), so the runner exposes
+      # AND the dependency-gate + source-identity mints below), so the runner exposes
       # ACTIONS_ID_TOKEN_REQUEST_* to EVERY step — a per-step `env:` cannot remove a
       # job-level permission. So harden the install itself: `--ignore-scripts` runs
       # NO lifecycle/postinstall code (pacote + the MCP SDK need none), so an
       # untrusted transitive dependency cannot execute code to mint/exfiltrate an
       # OIDC token here; blanking the request vars is belt-and-suspenders. The
-      # token is minted ONLY in the guarded submit step that immediately follows.
+      # tokens are minted ONLY in the guarded submit step that immediately follows.
       - name: Install submit-tool deps
         if: steps.gate.outputs.should_publish == 'true'
         run: |
@@ -463,36 +468,63 @@ jobs:
         if: steps.gate.outputs.should_publish == 'true'
         env:
           CINATRA_MARKETPLACE_VENDOR_TOKEN: ${{ secrets.CINATRA_MARKETPLACE_VENDOR_TOKEN }}
-          CINATRA_REGISTRY_TOKEN: ${{ secrets.CINATRA_REGISTRY_TOKEN }}
         run: |
           set -euo pipefail
-          # Mint a GitHub Actions OIDC token — GitHub-signed claims: repository,
+          # Mint GitHub Actions OIDC tokens — GitHub-signed claims: repository,
           # repository_owner, repository_visibility, and job_workflow_ref of THIS
-          # blessed reusable workflow — scoped to the marketplace audience, and hand
-          # it to the submit tool as CINATRA_SOURCE_IDENTITY_TOKEN. The marketplace
-          # public-repo predicate verifies it to auto-approve a first-party submit.
+          # blessed reusable workflow — scoped to the marketplace audience. The
+          # marketplace verifies them: the dependency-gate ability hard-fails an
+          # unverifiable caller, and the submit predicate auto-approves a first-party
+          # public submit.
           #
-          # BEST-EFFORT: a mint failure NEVER fails the publish — a missing token
-          # only routes the submission to manual moderation (it is never auto-
-          # rejected). The token is minted AND consumed inside THIS step: it is
-          # never written to GITHUB_OUTPUT / a file / a log, and is masked
-          # defensively before the submit tool runs.
-          if [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && [ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
-            OIDC_RESP="$(curl -sS \
+          # TWO SEPARATE tokens are minted because the marketplace abilities consume
+          # a SINGLE-USE jti per call: one token authenticates exactly ONE call.
+          # Token #1 (CINATRA_DEP_GATE_IDENTITY_TOKEN) authenticates the dependency-
+          # ordering gate's `cinatra/extension-dependency-exists` call inside the
+          # submit tool; token #2 (CINATRA_SOURCE_IDENTITY_TOKEN) is the source-
+          # identity for the submit call itself. Reusing one token for both would let
+          # the gate's consume break the submit (or vice-versa). Each curl to the
+          # request URL returns a token with a distinct jti. Tokens are minted AND
+          # consumed inside THIS step: never written to GITHUB_OUTPUT / a file / a
+          # log, and masked defensively before the submit tool runs.
+          mint_marketplace_oidc() {
+            # Echoes a fresh OIDC token (aud=marketplace) on stdout, or empty on any
+            # failure. Each call yields a distinct jti.
+            if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+              return 0
+            fi
+            resp="$(curl -sS \
               -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
               "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://marketplace.cinatra.ai" || true)"
-            CINATRA_SOURCE_IDENTITY_TOKEN="$(printf '%s' "$OIDC_RESP" | node -e 'let s="";process.stdin.on("data",d=>{s+=d});process.stdin.on("end",()=>{try{process.stdout.write(String(JSON.parse(s).value||""))}catch{process.stdout.write("")}})' || true)"
-            OIDC_RESP=""
-            if [ -n "${CINATRA_SOURCE_IDENTITY_TOKEN:-}" ]; then
-              echo "::add-mask::${CINATRA_SOURCE_IDENTITY_TOKEN}"
-              export CINATRA_SOURCE_IDENTITY_TOKEN
-              echo "Minted source-identity OIDC token (aud=https://marketplace.cinatra.ai)."
-            else
-              echo "::warning::source-identity OIDC mint returned no token — submitting without it (manual moderation)."
-            fi
+            printf '%s' "$resp" | node -e 'let s="";process.stdin.on("data",d=>{s+=d});process.stdin.on("end",()=>{try{process.stdout.write(String(JSON.parse(s).value||""))}catch{process.stdout.write("")}})' || true
+            resp=""
+          }
+
+          # Token #1 — dependency-ordering gate (MANDATORY in CI). The gate is the
+          # ordering guarantee; if no token can be minted, do NOT silently continue —
+          # the submit tool's gate fails CLOSED on an empty CINATRA_DEP_GATE_IDENTITY_TOKEN
+          # (no fallback to a registry read or a skip). We warn here; the tool emits
+          # the fatal, actionable failure.
+          CINATRA_DEP_GATE_IDENTITY_TOKEN="$(mint_marketplace_oidc)"
+          if [ -n "${CINATRA_DEP_GATE_IDENTITY_TOKEN:-}" ]; then
+            echo "::add-mask::${CINATRA_DEP_GATE_IDENTITY_TOKEN}"
+            export CINATRA_DEP_GATE_IDENTITY_TOKEN
+            echo "Minted dependency-gate OIDC token (aud=https://marketplace.cinatra.ai)."
           else
-            echo "::warning::OIDC token request env unavailable (id-token: write?) — submitting without a source-identity token."
+            echo "::warning::dependency-gate OIDC mint returned no token (id-token: write?) — the dependency-ordering gate will fail closed."
           fi
+
+          # Token #2 — submit source-identity (BEST-EFFORT). A missing token only
+          # routes the submission to manual moderation (never an auto-reject).
+          CINATRA_SOURCE_IDENTITY_TOKEN="$(mint_marketplace_oidc)"
+          if [ -n "${CINATRA_SOURCE_IDENTITY_TOKEN:-}" ]; then
+            echo "::add-mask::${CINATRA_SOURCE_IDENTITY_TOKEN}"
+            export CINATRA_SOURCE_IDENTITY_TOKEN
+            echo "Minted source-identity OIDC token (aud=https://marketplace.cinatra.ai)."
+          else
+            echo "::warning::source-identity OIDC mint returned no token — submitting without it (manual moderation)."
+          fi
+
           node "$RUNNER_TEMP/cinatra-submit/release-submit.mjs" "$PWD/${{ steps.pack.outputs.tarball }}"
 
       # Hand the EXACT submitted bytes to the github-release job below. Placed

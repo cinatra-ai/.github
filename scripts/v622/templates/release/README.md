@@ -22,9 +22,13 @@ promotion saga → `registry.cinatra.ai`), **never** a direct Verdaccio publish.
 2. `CINATRA_MARKETPLACE_VENDOR_TOKEN` is set as a **GitHub org secret**
    (submit-scope only — never an admin-approve or Verdaccio-publish token),
    scoped to extension repos + protected release refs.
-3. `registry.cinatra.ai` public-read is enabled (or `CINATRA_REGISTRY_TOKEN`, a
-   read-scope token, is provided) so the dependency-ordering gate can verify the
-   `@cinatra-ai/*` closure.
+3. The job grants `id-token: write` so the dependency-ordering gate can mint a
+   GitHub Actions OIDC token (`aud=https://marketplace.cinatra.ai`) and verify the
+   `@cinatra-ai/*` closure through the OIDC-gated marketplace ability
+   `cinatra/extension-dependency-exists` (broker-mediated). The gate never reads
+   `registry.cinatra.ai` directly — those reads are ACL-gated to the install-broker
+   (whose token is, by design, not in Actions). `CINATRA_REGISTRY_TOKEN` is
+   deprecated/unused for the CI gate.
 
 ## How a publish happens
 
