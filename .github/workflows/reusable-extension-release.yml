@@ -247,13 +247,22 @@ jobs:
       # the package's own deps, so the CENTRAL host pin WINS over any companion
       # framework declaration (a connector pinned to a different `next` major is
       # incompatible with the host runtime view and must not silently win).
-      # `--ignore-scripts`/`--legacy-peer-deps` mirror the step above. Unconditional
-      # on every serverEntry build: a graph that does NOT reach `next` simply does
-      # not import these (they stay unreferenced; a build-time grep pre-detector
-      # would be a fragile lower bound, so we always provision).
+      # `--ignore-scripts` mirrors the step above. We deliberately do NOT pass
+      # `--legacy-peer-deps` here (eng#121): with it, npm treats an explicitly-named
+      # install target that matches an existing host peerDependency as already
+      # satisfied-by-the-consumer and ELIDES placing it — react/react-dom are
+      # declared peers (^19.2.x) by serverEntry connectors, so the framework inputs
+      # would silently fail to land and the build would fail at the `next` →
+      # `Could not resolve "react"` wall. Standard peer resolution places all three.
+      # This step installs ONLY next/react/react-dom by explicit name with
+      # `--no-save` AFTER the package's own graph (line above), so it pulls no
+      # @cinatra-ai/* host peer of the connector — the legacy flag is unneeded here.
+      # Unconditional on every serverEntry build: a graph that does NOT reach `next`
+      # simply does not import these (they stay unreferenced; a build-time grep
+      # pre-detector would be a fragile lower bound, so we always provision).
       - name: Provision host framework build inputs (next/react/react-dom)
         if: steps.gate.outputs.should_publish == 'true' && steps.server_entry.outputs.declared == 'true'
-        run: npm install --no-save --no-package-lock --ignore-scripts --legacy-peer-deps --no-audit --no-fund next@16.2.6 react@19.2.6 react-dom@19.2.6
+        run: npm install --no-save --no-package-lock --ignore-scripts --no-audit --no-fund next@16.2.6 react@19.2.6 react-dom@19.2.6
 
       # esbuild is the builder's only dependency — installed `--ignore-scripts`
       # into an ISOLATED temp dir (never the extension tree), the same
