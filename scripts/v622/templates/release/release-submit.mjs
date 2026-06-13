@@ -168,6 +168,84 @@ export function selectExtensionDepsToProbe(manifest) {
   return { toProbe, skippedNonManifestCinatraDeps };
 }
 
+// An EXACT semver (MAJOR.MINOR.PATCH with an optional -prerelease/+build) — the
+// only version shape that can be a deterministic, vendor-declared pin. This MUST
+// be byte-for-byte the strict SemVer 2.0 grammar the marketplace reconciler uses
+// in ExtensionManifest::isExactSemver (no leading zeros on numeric identifiers;
+// well-formed pre-release/build identifiers) — a looser regex here would let the
+// tool emit a sidecar the reconciler then REJECTS, breaking "reconcilable by
+// construction". A `semver-range` that is itself an exact semver is the only
+// range form the reconciler accepts as a singleton; `*`/`^`/`~`/comparators are
+// NOT, and are refused below (fail-closed).
+const EXACT_SEMVER =
+  /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$/;
+
+// Build the marketplace `deps` SIDECAR — the vendor-declared exact-identity cover
+// of the artifact's REQUIRED extension closure. The marketplace reconciler
+// (ExtensionManifest::reconcile) diffs the artifact's `cinatra.dependencies`
+// REQUIRED runtime/install-time projection against this sidecar and REFUSES the
+// submit if any required edge has no satisfying pin ("Declared deps do not
+// reconcile with the artifact manifest"). The older wave path supplied this; the
+// portable submit tool MUST restore it or any connector with a real required edge
+// (e.g. resend→email-connector, twenty→crm-connector) fails submit.
+//
+// FAIL-CLOSED on ambiguity (codex-converged): a required edge MUST carry an
+// authoritative, deterministic EXACT version — either `versionConstraint
+// {kind:"exact",version}` or a `{kind:"semver-range",range}` whose range is
+// itself an exact semver. A `*`/`^`/`~`/comparator range, a `git-ref`, or a
+// missing constraint is REFUSED here (never inferred from the connector's own
+// version, npm, or any registry read) — the same v1 grammar the reconciler
+// enforces, so the sidecar this builds is reconcilable by construction.
+//
+// Returns an array of exact final identities "@<ns>/<ext>@<version>", or throws.
+export function buildRequiredDepsSidecar(manifest) {
+  const c = manifest?.cinatra?.dependencies;
+  if (c == null) return [];
+  const edges = [];
+  if (Array.isArray(c)) {
+    for (const e of c) {
+      if (e && typeof e === "object" && typeof e.packageName === "string") edges.push(e);
+    }
+  }
+  // The string / name→spec manifest forms carry no per-edge requirement or
+  // constraint, so they cannot declare a REQUIRED runtime/install-time edge that
+  // needs a sidecar pin — only the object-edge form does. (extractCinatraManifestDepNames
+  // already covers the string/object forms for the existence-only ordering gate.)
+  const sidecar = [];
+  const seen = new Set();
+  for (const edge of edges) {
+    if (edge.requirement !== "required") continue;
+    if (edge.edgeType !== "runtime" && edge.edgeType !== "install-time") continue;
+    const name = edge.packageName;
+    const vc = edge.versionConstraint;
+    let version = "";
+    if (vc && typeof vc === "object") {
+      if (vc.kind === "exact" && typeof vc.version === "string" && EXACT_SEMVER.test(vc.version)) {
+        version = vc.version;
+      } else if (vc.kind === "semver-range" && typeof vc.range === "string" && EXACT_SEMVER.test(vc.range)) {
+        version = vc.range;
+      }
+    }
+    if (!version) {
+      throw new Error(
+        `submit deps sidecar: required ${edge.edgeType} edge "${name}" has no deterministic exact version ` +
+          `(versionConstraint=${JSON.stringify(vc ?? null)}). The marketplace reconciler needs an exact pin: ` +
+          `declare versionConstraint {kind:"exact",version:"X.Y.Z"} (or a semver-range equal to an exact "X.Y.Z") ` +
+          `at the PROMOTED version of "${name}". Refusing to submit (fail-closed) — a non-singleton range cannot be pinned.`,
+      );
+    }
+    if (seen.has(name)) {
+      throw new Error(
+        `submit deps sidecar: required edge "${name}" is declared more than once in cinatra.dependencies ` +
+          `(the sidecar must be a canonical exact cover — duplicates are non-canonical). Refusing to submit.`,
+      );
+    }
+    seen.add(name);
+    sidecar.push(`${name}@${version}`);
+  }
+  return sidecar;
+}
+
 // Vendor SUBMIT auth (the marketplace MCP). CINATRA_MARKETPLACE_VENDOR_TOKEN may be
 // a full "Basic …"/"Bearer …" header OR a RAW WordPress application password (what
 // the wp-admin UI / Infisical hold). For a raw value, build HTTP Basic
@@ -628,6 +706,7 @@ export function buildSubmitArguments({
   tarballBase64,
   description,
   sourceIdentityToken,
+  deps,
 } = {}) {
   const args = {
     namespace,
@@ -638,6 +717,13 @@ export function buildSubmitArguments({
     tarball_base64: tarballBase64,
   };
   if (typeof description === "string" && description !== "") args.description = description;
+  // The vendor-declared exact-identity cover of the REQUIRED extension closure
+  // (cinatra.dependencies). Emitted ONLY when non-empty so a connector with no
+  // required edges stays byte-identical to the historical no-deps submit shape
+  // (the 0-edge connectors that already promoted). When present, the marketplace
+  // reconciles it against the artifact's required projection and refuses a
+  // divergence — so it MUST be the exact cover (see buildRequiredDepsSidecar).
+  if (Array.isArray(deps) && deps.length > 0) args.deps = deps;
   // The GitHub-signed OIDC source-identity token (proves repo/owner/visibility/
   // workflow). Forwarded ONLY when present; the marketplace owns size/shape
   // validation (an oversized/invalid token => manual moderation, never a reject).
@@ -716,6 +802,16 @@ async function submitTarball({ tarballPath, description, skipDependencyCheck }) 
   const artifactDigestSha256 = createHash("sha256").update(tarballBytes).digest("hex");
   const artifactSizeBytes = tarballBytes.byteLength;
 
+  // The marketplace `deps` sidecar: the exact-identity cover of the REQUIRED
+  // extension closure declared in the artifact's cinatra.dependencies. Built from
+  // the PACKED manifest (the same bytes the marketplace reconciles) and forwarded
+  // so the submit reconciles by construction. Fail-closed (throws) if a required
+  // edge lacks a deterministic exact version — never inferred.
+  const deps = buildRequiredDepsSidecar(manifest);
+  if (deps.length > 0) {
+    process.stderr.write(`ℹ submit deps sidecar (required extension closure): ${deps.join(", ")}\n`);
+  }
+
   const token = process.env.CINATRA_MARKETPLACE_VENDOR_TOKEN;
   if (!token) throw new Error("CINATRA_MARKETPLACE_VENDOR_TOKEN is not set (the submit-scope vendor token).");
   // GitHub-signed source-identity OIDC token, minted by the reusable release
@@ -751,6 +847,7 @@ async function submitTarball({ tarballPath, description, skipDependencyCheck }) 
           tarballBase64: tarballBytes.toString("base64"),
           description,
           sourceIdentityToken,
+          deps,
         }),
       },
       // resultSchema: keep the SDK default (pass undefined, not null).
