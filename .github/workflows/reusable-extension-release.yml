@@ -217,15 +217,43 @@ jobs:
           rm -rf .cinatra-release
 
       # Build inputs for the bundle: the extension's OWN declared dependencies
-      # (and devDependencies — e.g. `next` as an explicit build-time input for
-      # server graphs that import it) must be installed next to the package so
-      # esbuild can inline the runtime graph. `--legacy-peer-deps` skips peer
-      # auto-install (the @cinatra-ai/* host peers are NEVER on a public
-      # registry — model-B host-provided); `--ignore-scripts` runs no lifecycle
-      # code (same OIDC-hardening rationale as the submit-tool deps step below).
+      # (and devDependencies) must be installed next to the package so esbuild can
+      # inline the runtime graph. `--legacy-peer-deps` skips peer auto-install (the
+      # @cinatra-ai/* host peers are NEVER on a public registry — model-B
+      # host-provided); `--ignore-scripts` runs no lifecycle code (same
+      # OIDC-hardening rationale as the submit-tool deps step below).
       - name: Install server-entry build inputs
         if: steps.gate.outputs.should_publish == 'true' && steps.server_entry.outputs.declared == 'true'
         run: npm install --ignore-scripts --legacy-peer-deps --no-package-lock --no-audit --no-fund
+
+      # Host framework build inputs (cinatra-engineering#121). When a serverEntry
+      # graph reaches `next/*` the builder's `host-runtime-module-views` plugin
+      # FORCES resolution of `next` and inlines `react`/`react-dom` (they are NOT
+      # externalized — at runtime the HOST provides them; for the standalone
+      # bundle they are build-time-only inputs, compiled into register.mjs and
+      # pruned from the published deps). These are HOST-provided framework inputs,
+      # not per-connector dependencies, so we provision them in ONE place here
+      # rather than asking every companion repo to carry framework devDeps that
+      # would drift the host ABI across 11+ repos.
+      #
+      # Pinned EXACT to the cinatra monorepo (next@16.2.6 / react@19.2.6 /
+      # react-dom@19.2.6) so the standalone bundle matches the workspace build and
+      # the e2e-pinned builder behavior — the same host-version lockstep the
+      # esbuild@0.25.12 pin below already enforces. The release-template drift
+      # audit's build-input-pin check asserts these literals equal the cinatra
+      # root package.json so a workspace framework bump can't silently diverge.
+      #
+      # `--no-save` so the package.json is NEVER mutated; this install runs AFTER
+      # the package's own deps, so the CENTRAL host pin WINS over any companion
+      # framework declaration (a connector pinned to a different `next` major is
+      # incompatible with the host runtime view and must not silently win).
+      # `--ignore-scripts`/`--legacy-peer-deps` mirror the step above. Unconditional
+      # on every serverEntry build: a graph that does NOT reach `next` simply does
+      # not import these (they stay unreferenced; a build-time grep pre-detector
+      # would be a fragile lower bound, so we always provision).
+      - name: Provision host framework build inputs (next/react/react-dom)
+        if: steps.gate.outputs.should_publish == 'true' && steps.server_entry.outputs.declared == 'true'
+        run: npm install --no-save --no-package-lock --ignore-scripts --legacy-peer-deps --no-audit --no-fund next@16.2.6 react@19.2.6 react-dom@19.2.6
 
       # esbuild is the builder's only dependency — installed `--ignore-scripts`
       # into an ISOLATED temp dir (never the extension tree), the same
