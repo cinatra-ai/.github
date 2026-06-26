@@ -410,13 +410,33 @@ jobs:
           }
           console.log(`packlist gate OK — ${files.length} file(s), no disallowed paths.`);
           PACKLIST_GATE_EOF
-          ( cd "$PACK_DIR" && npm pack --dry-run --json --silent ) > "$RUNNER_TEMP/npm-packlist.json"
+          # `--ignore-scripts`: `npm pack --dry-run` STILL runs the package's
+          # prepare/prepack/postpack lifecycle scripts (npm only skips writing the
+          # tarball, not the hooks). Extracted/published manifests preserve their
+          # `scripts` verbatim (extract-extension-repos.mjs), and the job grants
+          # `id-token: write`, so a lifecycle hook here could mint/exfiltrate an
+          # OIDC token or mutate the tree the real pack then ships — the same trust
+          # boundary the install steps already harden with `--ignore-scripts`. The
+          # gate inspects the file LIST only; no lifecycle code is needed.
+          ( cd "$PACK_DIR" && npm pack --dry-run --json --silent --ignore-scripts ) > "$RUNNER_TEMP/npm-packlist.json"
           node "$RUNNER_TEMP/packlist-gate.mjs" "$RUNNER_TEMP/npm-packlist.json"
 
       # Packs FROM the staged serverEntry build dir when one exists (so the
       # tarball carries the built register.mjs + the rewritten PACKED manifest);
       # the tarball always lands in the workspace root so every downstream step
       # (attest, submit, Release assets) keeps a single path convention.
+      #
+      # `--ignore-scripts`: this job grants `id-token: write` (provenance + the
+      # dependency-gate/source-identity mints), so the runner exposes
+      # ACTIONS_ID_TOKEN_REQUEST_* to EVERY step — a per-step `env:` cannot remove
+      # a job-level permission, and GitHub Actions permissions are job-scoped (they
+      # cannot be scoped to a single step). So harden the pack itself, exactly as
+      # the install steps do: published/extracted manifests preserve their `scripts`
+      # verbatim (extract-extension-repos.mjs), and `npm pack` would otherwise run
+      # the package's prepare/prepack/postpack hooks while the OIDC request vars are
+      # present — a hook could mint/exfiltrate a token or mutate the packed bytes
+      # AFTER the packlist gate ran. The published artifact is the BUILT bytes
+      # already staged above; no lifecycle hook is needed to produce the tarball.
       - name: Pack
         id: pack
         if: steps.gate.outputs.should_publish == 'true'
@@ -424,7 +444,7 @@ jobs:
           PACK_DIR: ${{ steps.server_build.outputs.pack_dir || '.' }}
         run: |
           set -euo pipefail
-          TARBALL="$( ( cd "$PACK_DIR" && npm pack --silent --pack-destination "$GITHUB_WORKSPACE" ) | tail -n 1)"
+          TARBALL="$( ( cd "$PACK_DIR" && npm pack --silent --ignore-scripts --pack-destination "$GITHUB_WORKSPACE" ) | tail -n 1)"
           echo "tarball=${TARBALL}" >> "$GITHUB_OUTPUT"
           echo "Packed ${TARBALL} (from ${PACK_DIR})"
 
