@@ -1,0 +1,4 @@
+{
+    "name": "truthful-attribution-gate (cinatra-ai)",
+    "description": "Org-standard thin caller for the truthful-attribution gate in cinatra-ai/ci, double-pinned to a tagged release SHA. Verifies commit Assisted-by attribution trailers per ratified spec cinatra-engineering#119. Ships in WARN mode (findings annotated, check always green); the org rollout makes 'truthful-attribution-gate / truthful-attribution-gate' a required check, so every new repo needs this workflow seeded."
+}
