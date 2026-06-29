@@ -1,5 +1,5 @@
 # Code owners for cinatra-ai/.github.
-# FULL-tier repos require CODEOWNERS per cinatra-ai/cinatra-engineering#59 (AC4).
+# FULL-tier repos require CODEOWNERS per the org governance policy (AC4).
 # Listed owners are requested for review on PRs touching matching paths.
 # Reference: https://docs.github.com/articles/about-code-owners
 * @groganz @megajustice

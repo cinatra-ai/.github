@@ -22,7 +22,7 @@
 # rewritten manifest satisfies the runtime store's built-artifacts-only
 # contract; packing then runs FROM that stage) → packlist leak gate
 # (`npm pack --dry-run --json` must list no internal path: `.github/`,
-# `.planning`, env files, tests, CI/tooling config — cinatra-engineering#56)
+# `.planning`, env files, tests, CI/tooling config — per the packlist leak-gate policy)
 # → npm pack → provenance attestation → submit the EXACT bytes through the
 # marketplace MCP proxy (extension-submit-for-review), with the serverEntry
 # packed-manifest preflight + dependency-ordering gate enforced locally first.
@@ -231,7 +231,7 @@ jobs:
         if: steps.gate.outputs.should_publish == 'true' && steps.server_entry.outputs.declared == 'true'
         run: npm install --ignore-scripts --legacy-peer-deps --no-package-lock --no-audit --no-fund
 
-      # Host framework build inputs (cinatra-engineering#121). When a serverEntry
+      # Host framework build inputs. When a serverEntry
       # graph reaches `next/*` the builder's `host-runtime-module-views` plugin
       # FORCES resolution of `next` and inlines `react`/`react-dom` (they are NOT
       # externalized — at runtime the HOST provides them; for the standalone
@@ -253,7 +253,7 @@ jobs:
       # framework declaration (a connector pinned to a different `next` major is
       # incompatible with the host runtime view and must not silently win).
       # `--ignore-scripts` mirrors the step above. We deliberately do NOT pass
-      # `--legacy-peer-deps` here (eng#121): with it, npm treats an explicitly-named
+      # `--legacy-peer-deps` here: with it, npm treats an explicitly-named
       # install target that matches an existing host peerDependency as already
       # satisfied-by-the-consumer and ELIDES placing it — react/react-dom are
       # declared peers (^19.2.x) by serverEntry connectors, so the framework inputs
@@ -287,7 +287,7 @@ jobs:
             --json
           echo "pack_dir=$RUNNER_TEMP/cinatra-server-entry-pack/package" >> "$GITHUB_OUTPUT"
 
-      # Packlist leak gate (cinatra-engineering#56). The npm tarball is the
+      # Packlist leak gate. The npm tarball is the
       # DISTRIBUTION artifact crossing a trust boundary (publish-proxy →
       # registry → installer): the release FAILS here if `npm pack --dry-run
       # --json` would ship any non-distributable path — `.github/` (workflows
@@ -405,7 +405,7 @@ jobs:
             for (const [path, reason] of violations) {
               console.error(`::error::packlist gate: tarball would ship '${path}' (${reason})`);
             }
-            console.error(`::error::packlist gate: ${violations.length} disallowed path(s) in the npm pack listing — add a package.json "files" allowlist (cinatra-engineering#56). Refusing to publish.`);
+            console.error(`::error::packlist gate: ${violations.length} disallowed path(s) in the npm pack listing — add a package.json "files" allowlist. Refusing to publish.`);
             process.exit(1);
           }
           console.log(`packlist gate OK — ${files.length} file(s), no disallowed paths.`);
