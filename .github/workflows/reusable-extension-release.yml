@@ -57,6 +57,23 @@ on:
 jobs:
   release:
     runs-on: ubuntu-latest
+    # RELEASE-APPROVAL WALL (cinatra-engineering release-approval doctrine):
+    # this job PUBLISHES — it submits the exact extension bytes to the
+    # marketplace (extension-submit-for-review) AND decorates the tag's GitHub
+    # Release. GitHub pauses a job that references a PROTECTED Environment until a
+    # required reviewer approves it, so no `v*` tag auto-publishes an extension
+    # without an explicit human approval click. The `release-approval` Environment
+    # (required reviewer + prevent_self_review + can_admins_bypass=false) is
+    # provisioned per-repo via the GitHub API.
+    #   IMPORTANT — the guard is only REAL where the Environment is provisioned
+    #   WITH protection rules. GitHub auto-creates a referenced-but-missing
+    #   Environment with NO rules, in which case the job runs unblocked. So the
+    #   per-repo rollout (provisioning the protected Environment in every extension
+    #   repo) is what makes this binding everywhere; until then it is binding only
+    #   in repos that have it. Tracked on the active milestone board.
+    # NEVER remove this without explicit owner approval — it is the technical
+    # backstop for the no-autonomous-publish rule.
+    environment: release-approval
     permissions:
       contents: read
       id-token: write       # OIDC — provenance attestation AND the dependency-gate + source-identity token mints
