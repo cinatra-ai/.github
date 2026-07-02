@@ -21,8 +21,7 @@ caller invokes the central reusable workflow, which:
    (except `.env.example`), key material, tests/fixtures, or CI/build/lint
    tooling config (`tsconfig*.json`, bundler/test-runner configs, …). npm's
    force-included root `package.json` / `README*` / `LICENSE*` never flag; the
-   fix in a flagged repo is a package.json `files` **allowlist**
-   (cinatra-engineering#56),
+   fix in a flagged repo is a package.json `files` **allowlist**,
 5. `npm pack`s the exact bytes and attests **build provenance** for that tarball,
 6. runs the existence-based **dependency-ordering gate** (every `@cinatra-ai/*`
    dependency must already be published on `registry.cinatra.ai`),
