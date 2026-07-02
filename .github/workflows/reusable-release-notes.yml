@@ -87,6 +87,15 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
+          # Annotated tags MUST survive to the tagmeta step. Without this,
+          # checkout's tag-push path re-fetches the pushed ref BY COMMIT SHA
+          # (`+<sha>:refs/tags/<tag>`), overwriting the annotated tag OBJECT
+          # locally with a lightweight (commit) ref — so `git cat-file -t` below
+          # would falsely report a LIGHTWEIGHT tag for a genuinely annotated one.
+          # fetch-tags keeps the `+refs/tags/*:refs/tags/*` refspec that carries
+          # the tag object. (The tagmeta step ALSO force-refetches tag refs as a
+          # belt-and-suspenders against checkout-version drift.)
+          fetch-tags: true
 
       - name: Verify tag is annotated + compute previous semver tag
         if: steps.gate.outputs.should_run == 'true'
@@ -95,6 +104,16 @@ jobs:
           TAG: ${{ steps.gate.outputs.tag }}
         run: |
           set -euo pipefail
+          # Re-establish the ANNOTATED tag objects locally before inspecting
+          # them. `actions/checkout`'s tag-push path can rewrite the local tag
+          # ref to point at the commit (a lightweight ref) via a
+          # `+<sha>:refs/tags/<tag>` fetch, which would make an annotated tag
+          # look lightweight to `git cat-file -t` below. Force-refetching the
+          # tag refs restores the tag OBJECT (a truly lightweight tag on the
+          # remote still resolves to a commit, so the gate below still rejects
+          # it). Belt-and-suspenders with the checkout step's `fetch-tags: true`
+          # — this also survives a checkout-version change to that behaviour.
+          git fetch --force --tags origin '+refs/tags/*:refs/tags/*' >/dev/null 2>&1 || true
           # Annotated-tag check: an annotated tag is a `tag` object; a
           # lightweight tag resolves to a `commit`. The org release contract
           # requires annotated tags (immutable intent + tagger/date metadata)
