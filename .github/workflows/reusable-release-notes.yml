@@ -23,6 +23,14 @@
 #     existing Release body is backfilled only when empty/whitespace.
 #   - Idempotent + race-safe: re-runs no-op on an already-decorated Release;
 #     a create race falls back to the decorate path.
+#   - Reporter credit: each "What's Changed" PR line gets `Reported by
+#     @handle` appended when a linked (closing) issue's author differs from
+#     the PR author — derived ONLY from the PR's closingIssuesReferences (the
+#     platform link graph), never `Closes #N` text-parsing. Self-reported /
+#     no linked issue / bot reporter is omitted; a private-repo reporter is
+#     NEVER surfaced (fail-closed — see scripts/decorate-release-notes.mjs).
+#     A credit-lookup failure never fails the run: it just leaves the raw,
+#     undecorated GitHub notes in place.
 #
 # Caller contract: trigger on `push: tags: ["v*"]` (plus an optional
 # `workflow_dispatch` with a `tag` input for backfilling existing tags — old
@@ -97,6 +105,31 @@ jobs:
           # belt-and-suspenders against checkout-version drift.)
           fetch-tags: true
 
+      # This reusable workflow is CALLED by other repos (`uses: cinatra-ai/
+      # .github/.github/workflows/reusable-release-notes.yml@<ref>`) — the
+      # checkout above is the CALLER's repo, not this one, so the reporter-
+      # credit decoration script below isn't on disk yet. Pull the repo/SHA
+      # that actually defines the running job (`job.workflow_repository` +
+      # `job.workflow_sha`) — NOT `github.repository`/`github.sha` (the
+      # caller's repo/commit), and NOT any top-level `github.workflow_*`
+      # equivalent (the reusable-workflow's own identity is only exposed on
+      # the `job` context) — so the script always matches the workflow logic
+      # that invokes it, into a side directory that can't collide with the
+      # caller's tree.
+      - name: Checkout release-notes decoration script (this repo, pinned to the running workflow's own SHA)
+        if: steps.gate.outputs.should_run == 'true'
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .release-notes-tooling
+
+      - name: Set up Node.js (reporter-credit decoration)
+        if: steps.gate.outputs.should_run == 'true'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24"
+
       - name: Verify tag is annotated + compute previous semver tag
         if: steps.gate.outputs.should_run == 'true'
         id: tagmeta
@@ -169,12 +202,80 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Raw GitHub-generated "What's Changed" PR-list notes for $TAG,
+          # pinned to $PREV when a previous semver tag exists.
+          generate_raw_notes() {
+            local args=(-f tag_name="$TAG")
+            if [ -n "$PREV" ]; then
+              args+=(-f previous_tag_name="$PREV")
+            fi
+            gh api "repos/${REPO}/releases/generate-notes" "${args[@]}" --jq .body
+          }
+
+          # Adds `Reported by @handle` credit to each "What's Changed" PR line
+          # whose linked (closing) issue's author differs from the PR author —
+          # the org's reporter-credit convention. Reporter data comes ONLY
+          # from each PR's closingIssuesReferences
+          # (the platform link graph), never `Closes #N` text-parsing. Fails
+          # closed and NEVER fails the run: any error fetching/applying credit
+          # data (or no PRs at all, e.g. a first release) leaves the raw notes
+          # exactly as GitHub generated them — a missing credit is cosmetic,
+          # never a reason to break Release publication.
+          decorate_notes() {
+            local raw_file="$1" out_file="$2"
+            local owner="${REPO%%/*}" repo_name="${REPO#*/}"
+            local pr_numbers
+            pr_numbers=$(grep -oE '/pull/[0-9]+' "$raw_file" | grep -oE '[0-9]+' | sort -un || true)
+            if [ -z "$pr_numbers" ]; then
+              cp "$raw_file" "$out_file"
+              return 0
+            fi
+            local aliases="" n
+            for n in $pr_numbers; do
+              aliases+="pr${n}: pullRequest(number: ${n}) { closingIssuesReferences(first: 100) { nodes { author { login __typename } repository { isPrivate } } } } "
+            done
+            local query
+            query=$(printf 'query { repository(owner: %s, name: %s) { %s } }' \
+              "$(jq -Rn --arg s "$owner" '$s')" "$(jq -Rn --arg s "$repo_name" '$s')" "$aliases")
+            if ! gh api graphql -f query="$query" > graphql-raw.json 2>graphql.err; then
+              echo "::warning::Reporter-credit lookup failed (closingIssuesReferences query) — leaving notes undecorated. $(cat graphql.err)"
+              cp "$raw_file" "$out_file"
+              return 0
+            fi
+            # Normalize into { "<prNumber>": [{login, isPrivate, isBot}] }.
+            # isPrivate defaults to true (fail-closed) whenever GitHub didn't
+            # resolve it explicitly to false — an unresolved/inaccessible
+            # linked repo must NEVER be assumed public.
+            if ! jq '
+              (.data.repository // {})
+              | to_entries
+              | map(select(.value != null))
+              | map({
+                  key: (.key | ltrimstr("pr")),
+                  value: ((.value.closingIssuesReferences.nodes // []) | map({
+                    login: .author.login,
+                    isPrivate: (if .repository.isPrivate == false then false else true end),
+                    isBot: (.author.__typename == "Bot")
+                  }))
+                })
+              | from_entries
+            ' graphql-raw.json > closing-issues.json; then
+              echo "::warning::Reporter-credit data normalization failed — leaving notes undecorated."
+              cp "$raw_file" "$out_file"
+              return 0
+            fi
+            if ! node .release-notes-tooling/scripts/decorate-release-notes.mjs "$raw_file" closing-issues.json > "$out_file"; then
+              echo "::warning::Reporter-credit decoration failed — leaving notes undecorated."
+              cp "$raw_file" "$out_file"
+            fi
+          }
+
           # Backfill ONLY when the body is empty/whitespace — the same check on
           # every path, so even a create race can never overwrite notes a human
-          # wrote concurrently. The notes are generated FIRST and the body is
-          # re-read immediately before the edit, shrinking the unavoidable
-          # check-then-write window (the releases API has no compare-and-swap)
-          # to the single view→edit hop.
+          # wrote concurrently. The notes are generated (+ credit-decorated)
+          # FIRST and the body is re-read immediately before the edit,
+          # shrinking the unavoidable check-then-write window (the releases
+          # API has no compare-and-swap) to the single view→edit hop.
           backfill_if_empty() {
             local body
             body="$(gh release view "$TAG" --repo "$REPO" --json body --jq '.body // ""' 2>/dev/null)" || return 1
@@ -182,14 +283,8 @@ jobs:
               echo "::notice::Release $TAG already has notes — left untouched (author-written notes are never overwritten)."
               return 0
             fi
-            # `gh release edit` has no --generate-notes: generate via REST,
-            # then edit. previous_tag_name pins the PR-list range when a
-            # previous semver tag exists.
-            local args=(-f tag_name="$TAG")
-            if [ -n "$PREV" ]; then
-              args+=(-f previous_tag_name="$PREV")
-            fi
-            gh api "repos/${REPO}/releases/generate-notes" "${args[@]}" --jq .body > notes.md || return 1
+            generate_raw_notes > notes.md || return 1
+            decorate_notes notes.md notes-decorated.md || return 1
             # Re-check just before writing: a human may have written notes
             # while the generate call ran.
             body="$(gh release view "$TAG" --repo "$REPO" --json body --jq '.body // ""' 2>/dev/null)" || return 1
@@ -198,7 +293,7 @@ jobs:
               return 0
             fi
             echo "Release $TAG has an empty body — backfilling auto-generated PR-list notes."
-            gh release edit "$TAG" --repo "$REPO" --notes-file notes.md || return 1
+            gh release edit "$TAG" --repo "$REPO" --notes-file notes-decorated.md || return 1
           }
 
           decorate() {
@@ -206,10 +301,14 @@ jobs:
               backfill_if_empty || return 1
               return 0
             fi
-            local create_args=(--repo "$REPO" --title "$TAG" --generate-notes --verify-tag)
-            if [ -n "$PREV" ]; then
-              create_args+=(--notes-start-tag "$PREV")
-            fi
+            # Generate + credit-decorate BEFORE creating: `--generate-notes` on
+            # `gh release create` would bypass the reporter-credit decoration
+            # (GitHub builds the body server-side), so the notes are built
+            # explicitly here and passed via --notes-file instead (still
+            # --verify-tag, still never creates the tag).
+            generate_raw_notes > notes.md || return 1
+            decorate_notes notes.md notes-decorated.md || return 1
+            local create_args=(--repo "$REPO" --title "$TAG" --notes-file notes-decorated.md --verify-tag)
             if gh release create "$TAG" "${create_args[@]}"; then
               return 0
             fi
