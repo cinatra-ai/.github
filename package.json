@@ -1,0 +1,13 @@
+{
+  "name": "@cinatra-ai/dot-github",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Org-wide reusable GitHub Actions workflows for cinatra-ai.",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test scripts/__tests__/*.test.mjs"
+  }
+}
