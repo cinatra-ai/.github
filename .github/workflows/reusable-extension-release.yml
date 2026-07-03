@@ -57,7 +57,7 @@ on:
 jobs:
   release:
     runs-on: ubuntu-latest
-    # RELEASE-APPROVAL WALL (cinatra-engineering release-approval doctrine):
+    # RELEASE-APPROVAL WALL (internal release-approval doctrine):
     # this job PUBLISHES — it submits the exact extension bytes to the
     # marketplace (extension-submit-for-review) AND decorates the tag's GitHub
     # Release. GitHub pauses a job that references a PROTECTED Environment until a
