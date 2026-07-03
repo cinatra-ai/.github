@@ -74,6 +74,14 @@ const MCP_ROUTE = "/wp-json/cinatra/mcp";
 // `cinatra/extension-submit-for-review` is called as
 // `cinatra-extension-submit-for-review`).
 export const DEP_EXISTS_TOOL_NAME = "cinatra-extension-dependency-exists";
+// The RESOLUTION ability (distinct from the booleans-only existence ability
+// above, whose contract is untouched): given a first-party name + a caret range,
+// it returns the HIGHEST promoted+reconciled version that satisfies the range
+// (SemVer order, prereleases excluded), or fails closed if none. Used to turn a
+// `semver-range` caret into the deterministic exact pin the marketplace
+// reconciler requires — so a dependent declaring `^0.1.0` need not re-pin an
+// exact version by hand at each dependency release.
+export const DEP_RESOLVE_TOOL_NAME = "cinatra-extension-dependency-resolve";
 // The deployed ability caps a batch at 64 names (one single-use OIDC jti
 // authenticates exactly one batched call). A manifest declaring more first-party
 // extension edges than this is implausible — but the gate must FAIL CLOSED with a
@@ -180,6 +188,13 @@ export function selectExtensionDepsToProbe(manifest) {
 const EXACT_SEMVER =
   /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$/;
 
+// A STRICT caret over an exact MAJOR.MINOR.PATCH core, no prerelease/build — the
+// ONLY range shape the sidecar builder will resolve (via the resolve ability) to
+// an exact pin. Everything else a `semver-range` might carry (`*`, `~`, a
+// comparator set, a caret with a prerelease) stays fail-closed `unsupported`,
+// matching the marketplace reconciler's v1 grammar extension (strict `^X.Y.Z`).
+const CARET_RANGE = /^\^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
+
 // Build the marketplace `deps` SIDECAR — the vendor-declared exact-identity cover
 // of the artifact's REQUIRED extension closure. The marketplace reconciler
 // (ExtensionManifest::reconcile) diffs the artifact's `cinatra.dependencies`
@@ -198,7 +213,7 @@ const EXACT_SEMVER =
 // enforces, so the sidecar this builds is reconcilable by construction.
 //
 // Returns an array of exact final identities "@<ns>/<ext>@<version>", or throws.
-export function buildRequiredDepsSidecar(manifest) {
+export async function buildRequiredDepsSidecar(manifest, { resolveRange } = {}) {
   const c = manifest?.cinatra?.dependencies;
   if (c == null) return [];
   const edges = [];
@@ -222,16 +237,40 @@ export function buildRequiredDepsSidecar(manifest) {
     if (vc && typeof vc === "object") {
       if (vc.kind === "exact" && typeof vc.version === "string" && EXACT_SEMVER.test(vc.version)) {
         version = vc.version;
-      } else if (vc.kind === "semver-range" && typeof vc.range === "string" && EXACT_SEMVER.test(vc.range)) {
-        version = vc.range;
+      } else if (vc.kind === "semver-range" && typeof vc.range === "string") {
+        if (EXACT_SEMVER.test(vc.range)) {
+          // A range that is itself an exact semver — a singleton pin (as before).
+          version = vc.range;
+        } else if (CARET_RANGE.test(vc.range)) {
+          // A strict caret — resolve it to the highest PROMOTED+RECONCILED exact
+          // version via the broker resolve ability. The resolver is injected by
+          // the submit flow (the real MCP callTool) / by tests (a fake). If none
+          // is available (no OIDC token / not in CI), fail CLOSED rather than
+          // guess an inexact or drifting pin.
+          if (typeof resolveRange !== "function") {
+            throw new Error(
+              `submit deps sidecar: required ${edge.edgeType} edge "${name}" declares a caret range ${JSON.stringify(vc.range)} ` +
+                `but no dependency resolver is available (CINATRA_DEP_GATE_IDENTITY_TOKEN unset / not in CI). ` +
+                `A caret must resolve to the highest PROMOTED+RECONCILED version via the marketplace resolve ability. ` +
+                `Refusing to submit (fail-closed).`,
+            );
+          }
+          version = await resolveRange(name, vc.range);
+          if (typeof version !== "string" || !EXACT_SEMVER.test(version)) {
+            throw new Error(
+              `submit deps sidecar: resolving caret ${JSON.stringify(vc.range)} for "${name}" did not yield an exact version ` +
+                `(got ${JSON.stringify(version ?? null)}). Fail-closed.`,
+            );
+          }
+        }
       }
     }
     if (!version) {
       throw new Error(
         `submit deps sidecar: required ${edge.edgeType} edge "${name}" has no deterministic exact version ` +
           `(versionConstraint=${JSON.stringify(vc ?? null)}). The marketplace reconciler needs an exact pin: ` +
-          `declare versionConstraint {kind:"exact",version:"X.Y.Z"} (or a semver-range equal to an exact "X.Y.Z") ` +
-          `at the PROMOTED version of "${name}". Refusing to submit (fail-closed) — a non-singleton range cannot be pinned.`,
+          `declare versionConstraint {kind:"exact",version:"X.Y.Z"} (or a strict caret "^X.Y.Z" resolvable to a ` +
+          `PROMOTED version of "${name}"). Refusing to submit (fail-closed) — an unsupported range cannot be pinned.`,
       );
     }
     if (seen.has(name)) {
@@ -244,6 +283,26 @@ export function buildRequiredDepsSidecar(manifest) {
     sidecar.push(`${name}@${version}`);
   }
   return sidecar;
+}
+
+// True when a manifest has at least one REQUIRED runtime/install-time edge whose
+// constraint is a strict caret range needing broker resolution. The submit flow
+// uses this to open the resolve MCP route (and require the OIDC token) ONLY when
+// a caret is actually present — a manifest with no caret edges submits exactly as
+// before (no new network, no new token requirement — no regression).
+export function requiresRangeResolution(manifest) {
+  const c = manifest?.cinatra?.dependencies;
+  if (!Array.isArray(c)) return false;
+  for (const edge of c) {
+    if (!edge || typeof edge !== "object") continue;
+    if (edge.requirement !== "required") continue;
+    if (edge.edgeType !== "runtime" && edge.edgeType !== "install-time") continue;
+    const vc = edge.versionConstraint;
+    if (vc && vc.kind === "semver-range" && typeof vc.range === "string" && !EXACT_SEMVER.test(vc.range) && CARET_RANGE.test(vc.range)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // Vendor SUBMIT auth (the marketplace MCP). CINATRA_MARKETPLACE_VENDOR_TOKEN may be
@@ -407,6 +466,61 @@ export async function lookupExtensionExistence(
     }
   }
   return lookup;
+}
+
+// Resolve a caret RANGE to a deterministic exact pin via the broker-mediated
+// marketplace ability `cinatra-extension-dependency-resolve`. Given a first-party
+// name + a strict caret range, the ability returns the HIGHEST promoted+reconciled
+// version satisfying the range (SemVer order, prereleases excluded), or fails
+// closed if none. Mirrors lookupExtensionExistence exactly: `callToolImpl` is
+// injected (production MCP route vs a test fake), the OIDC token travels in the
+// BODY (never a header/argv), a single-use jti means NO retry, and every
+// non-success (transport error, isError, missing/inexact version) is fatal —
+// the sidecar must be reconcilable by construction or the submit is refused.
+export async function resolveDependencyVersion(
+  name,
+  range,
+  { identityToken, callToolImpl, toolName = DEP_RESOLVE_TOOL_NAME, timeoutMs = DEP_GATE_TIMEOUT_MS } = {},
+) {
+  if (typeof callToolImpl !== "function") {
+    throw new Error("resolveDependencyVersion: no callTool implementation available");
+  }
+  if (typeof identityToken !== "string" || identityToken === "") {
+    throw new Error(
+      "submit deps sidecar: no GitHub Actions OIDC identity token available " +
+        "(CINATRA_DEP_GATE_IDENTITY_TOKEN unset) — resolving a caret range to an exact pin " +
+        "requires the broker-mediated resolve ability. Refusing to submit (fail-closed).",
+    );
+  }
+  if (typeof name !== "string" || !DEP_NAME_PATTERN.test(name)) {
+    throw new Error(`submit deps sidecar: "${name}" is not a valid first-party @cinatra-ai/<ext> name (fail-closed).`);
+  }
+  if (typeof range !== "string" || !CARET_RANGE.test(range)) {
+    throw new Error(`submit deps sidecar: "${range}" is not a strict caret range for "${name}" (fail-closed).`);
+  }
+
+  let result;
+  try {
+    result = await callToolImpl(toolName, { source_identity_token: identityToken, name, range }, { timeoutMs });
+  } catch (err) {
+    throw new Error(
+      `submit deps sidecar: the marketplace ability "${toolName}" call failed for "${name}@${range}": ` +
+        (err instanceof Error ? err.message : String(err)),
+    );
+  }
+  if (result?.isError) {
+    const txt = Array.isArray(result.content) ? result.content.find((c) => c.type === "text")?.text : null;
+    throw new Error(`submit deps sidecar: the marketplace ability "${toolName}" returned an error for "${name}@${range}": ${txt ?? "unknown"}`);
+  }
+  const out = result?.structuredContent ?? {};
+  const version = out.version;
+  if (typeof version !== "string" || !EXACT_SEMVER.test(version)) {
+    throw new Error(
+      `submit deps sidecar: the resolve ability returned no exact version for "${name}@${range}" ` +
+        `(got ${JSON.stringify(version ?? null)}). No PROMOTED+RECONCILED version satisfies the range — fail-closed.`,
+    );
+  }
+  return version;
 }
 
 // Verify the @cinatra-ai/* dependency-ordering closure via the broker-mediated
@@ -807,7 +921,28 @@ async function submitTarball({ tarballPath, description, skipDependencyCheck }) 
   // the PACKED manifest (the same bytes the marketplace reconciles) and forwarded
   // so the submit reconciles by construction. Fail-closed (throws) if a required
   // edge lacks a deterministic exact version — never inferred.
-  const deps = buildRequiredDepsSidecar(manifest);
+  //
+  // A required edge MAY declare a strict caret range (`^X.Y.Z`) instead of an
+  // exact pin; that caret is resolved to the highest PROMOTED+RECONCILED exact
+  // version via the broker resolve ability. We only open the resolve MCP route
+  // (and require the dep-gate OIDC token) when a caret is actually present — a
+  // manifest whose required edges are all exact/singleton submits exactly as
+  // before (no new network, no new token requirement).
+  let deps;
+  if (requiresRangeResolution(manifest)) {
+    const resolveBaseUrl = (process.env.MARKETPLACE_BASE_URL || MARKETPLACE_BASE_URL).replace(/\/+$/, "");
+    const depGateIdentityToken = process.env.CINATRA_DEP_GATE_IDENTITY_TOKEN;
+    deps = await withMcpCallTool(
+      { baseUrl: resolveBaseUrl, headers: {}, clientName: "cinatra-release-dep-resolve" },
+      (callTool) =>
+        buildRequiredDepsSidecar(manifest, {
+          resolveRange: (name, range) =>
+            resolveDependencyVersion(name, range, { identityToken: depGateIdentityToken, callToolImpl: callTool }),
+        }),
+    );
+  } else {
+    deps = await buildRequiredDepsSidecar(manifest);
+  }
   if (deps.length > 0) {
     process.stderr.write(`ℹ submit deps sidecar (required extension closure): ${deps.join(", ")}\n`);
   }
