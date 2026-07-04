@@ -35,7 +35,11 @@
 // Tokens: CINATRA_MARKETPLACE_VENDOR_TOKEN (the submit-scope GitHub org secret, for
 // the submit MCP call) and CINATRA_DEP_GATE_IDENTITY_TOKEN (a GitHub Actions OIDC
 // token, aud=marketplace, minted by the reusable workflow for the dependency-gate
-// ability call — see below).
+// ability call — see below). Every marketplace source-identity ability consumes a
+// SINGLE-USE jti — one token authenticates exactly ONE ability call — so the caret
+// RESOLVE path (which runs AFTER the gate has consumed the dep-gate token) mints a
+// FRESH token PER resolve call from the runner's ambient OIDC endpoint
+// ({@link mintCiOidcToken}) instead of reusing either pre-minted token.
 //
 // Gate scope vs. the dev CLI: this portable gate is EXISTENCE-based — it asks
 // "is every @cinatra-ai/* EXTENSION EDGE (cinatra.dependencies) published at all?",
@@ -103,6 +107,43 @@ const SUBMIT_TIMEOUT_MS = Number(process.env.CINATRA_SUBMIT_TIMEOUT_MS || 600_00
 // retry — the OIDC token's single-use jti may already have been consumed server-side,
 // so a retry would need a freshly minted token. Override via CINATRA_DEP_GATE_TIMEOUT_MS.
 const DEP_GATE_TIMEOUT_MS = Number(process.env.CINATRA_DEP_GATE_TIMEOUT_MS || 60_000);
+
+// The marketplace OIDC audience every source-identity ability verifies — the same
+// value the reusable release workflow mints the two pre-minted tokens with.
+export const MARKETPLACE_OIDC_AUDIENCE = "https://marketplace.cinatra.ai";
+
+// Mint a FRESH GitHub Actions OIDC identity token (aud=marketplace) from the
+// runner's ambient endpoint (ACTIONS_ID_TOKEN_REQUEST_URL/_TOKEN — exposed to
+// EVERY step of a job granted `id-token: write`, which the blessed reusable
+// release workflow grants). Every marketplace source-identity ability consumes a
+// SINGLE-USE jti per call, so each ability call needs its OWN token: the
+// dependency-ordering gate consumes CINATRA_DEP_GATE_IDENTITY_TOKEN with its ONE
+// batched existence call, the submit consumes CINATRA_SOURCE_IDENTITY_TOKEN —
+// REUSING either for a caret resolve call is a deterministic replay rejection
+// (403 "The source identity does not satisfy the dependency-resolution policy",
+// audit reason `token_replayed`). Returns null when no ambient endpoint exists
+// (manual/local runs) so the caller can fail closed with an actionable message;
+// an endpoint that ERRORS is fatal (throw) — never silently tokenless.
+export async function mintCiOidcToken({ audience = MARKETPLACE_OIDC_AUDIENCE, fetchImpl = fetch, env = process.env } = {}) {
+  const requestUrl = env.ACTIONS_ID_TOKEN_REQUEST_URL;
+  const requestBearer = env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
+  if (!requestUrl || !requestBearer) return null;
+  const sep = requestUrl.includes("?") ? "&" : "?";
+  let res;
+  try {
+    res = await fetchImpl(`${requestUrl}${sep}audience=${encodeURIComponent(audience)}`, {
+      headers: { Authorization: `Bearer ${requestBearer}` },
+    });
+  } catch (err) {
+    throw new Error(`OIDC mint request failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (!res || !res.ok) {
+    throw new Error(`OIDC mint failed: HTTP ${res?.status ?? "?"} from the runner's id-token endpoint.`);
+  }
+  const body = await res.json();
+  const value = body?.value;
+  return typeof value === "string" && value !== "" ? value : null;
+}
 
 // --- dependency-ordering gate (existence-based; the @cinatra-ai/* extension-edge
 //     SELECTION mirrors packages/cli/src/extensions-dependency-gate.mjs; existence
@@ -250,7 +291,7 @@ export async function buildRequiredDepsSidecar(manifest, { resolveRange } = {}) 
           if (typeof resolveRange !== "function") {
             throw new Error(
               `submit deps sidecar: required ${edge.edgeType} edge "${name}" declares a caret range ${JSON.stringify(vc.range)} ` +
-                `but no dependency resolver is available (CINATRA_DEP_GATE_IDENTITY_TOKEN unset / not in CI). ` +
+                `but no dependency resolver is available (not running in CI with an ambient OIDC endpoint). ` +
                 `A caret must resolve to the highest PROMOTED+RECONCILED version via the marketplace resolve ability. ` +
                 `Refusing to submit (fail-closed).`,
             );
@@ -487,9 +528,9 @@ export async function resolveDependencyVersion(
   }
   if (typeof identityToken !== "string" || identityToken === "") {
     throw new Error(
-      "submit deps sidecar: no GitHub Actions OIDC identity token available " +
-        "(CINATRA_DEP_GATE_IDENTITY_TOKEN unset) — resolving a caret range to an exact pin " +
-        "requires the broker-mediated resolve ability. Refusing to submit (fail-closed).",
+      "submit deps sidecar: no GitHub Actions OIDC identity token available for this resolve call — " +
+        "the ability consumes a single-use jti per call, so the caller must mint a FRESH token per " +
+        "resolve (mintCiOidcToken; never a reused/pre-consumed one). Refusing to submit (fail-closed).",
     );
   }
   if (typeof name !== "string" || !DEP_NAME_PATTERN.test(name)) {
@@ -521,6 +562,30 @@ export async function resolveDependencyVersion(
     );
   }
   return version;
+}
+
+// Production caret resolver: ONE freshly minted single-use OIDC token PER resolve
+// call. NEVER reuses CINATRA_DEP_GATE_IDENTITY_TOKEN — by the time a caret edge
+// resolves, the dependency-ordering gate has ALREADY consumed that token's
+// single-use jti (one token authenticates exactly ONE marketplace ability call),
+// so reuse is a deterministic replay rejection: the marketplace verifier returns
+// 403 "The source identity does not satisfy the dependency-resolution policy"
+// (audit reason `token_replayed`). Minting is per-call because a manifest may
+// declare SEVERAL caret edges and the resolve ability cannot batch (one
+// name+range per call). `mintTokenImpl` is injected for tests; production uses
+// the runner's ambient OIDC endpoint via {@link mintCiOidcToken}.
+export function makeCaretRangeResolver({ callToolImpl, mintTokenImpl = mintCiOidcToken } = {}) {
+  return async (name, range) => {
+    const identityToken = await mintTokenImpl();
+    if (typeof identityToken !== "string" || identityToken === "") {
+      throw new Error(
+        `submit deps sidecar: cannot mint a GitHub Actions OIDC token for the caret resolve of "${name}@${range}" ` +
+          `(no ambient ACTIONS_ID_TOKEN_REQUEST_URL/_TOKEN — not a CI job with id-token: write). ` +
+          `Each resolve call consumes its OWN single-use token. Refusing to submit (fail-closed).`,
+      );
+    }
+    return resolveDependencyVersion(name, range, { identityToken, callToolImpl });
+  };
 }
 
 // Verify the @cinatra-ai/* dependency-ordering closure via the broker-mediated
@@ -925,19 +990,24 @@ async function submitTarball({ tarballPath, description, skipDependencyCheck }) 
   // A required edge MAY declare a strict caret range (`^X.Y.Z`) instead of an
   // exact pin; that caret is resolved to the highest PROMOTED+RECONCILED exact
   // version via the broker resolve ability. We only open the resolve MCP route
-  // (and require the dep-gate OIDC token) when a caret is actually present — a
+  // (and mint per-call OIDC tokens) when a caret is actually present — a
   // manifest whose required edges are all exact/singleton submits exactly as
   // before (no new network, no new token requirement).
+  //
+  // NEVER reuse CINATRA_DEP_GATE_IDENTITY_TOKEN here: the dependency-ordering
+  // gate above has ALREADY consumed that token's single-use jti (one token
+  // authenticates exactly ONE marketplace ability call), so reusing it makes the
+  // resolve ability's verifier reject every call as a replay — a deterministic
+  // 403 for any manifest with both an extension edge and a caret. Each caret
+  // edge instead mints its own fresh token (see makeCaretRangeResolver).
   let deps;
   if (requiresRangeResolution(manifest)) {
     const resolveBaseUrl = (process.env.MARKETPLACE_BASE_URL || MARKETPLACE_BASE_URL).replace(/\/+$/, "");
-    const depGateIdentityToken = process.env.CINATRA_DEP_GATE_IDENTITY_TOKEN;
     deps = await withMcpCallTool(
       { baseUrl: resolveBaseUrl, headers: {}, clientName: "cinatra-release-dep-resolve" },
       (callTool) =>
         buildRequiredDepsSidecar(manifest, {
-          resolveRange: (name, range) =>
-            resolveDependencyVersion(name, range, { identityToken: depGateIdentityToken, callToolImpl: callTool }),
+          resolveRange: makeCaretRangeResolver({ callToolImpl: callTool }),
         }),
     );
   } else {
