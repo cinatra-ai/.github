@@ -15,6 +15,13 @@
       "matchManagers": ["github-actions"],
       "matchPackageNames": ["cinatra-ai/ci"],
       "enabled": false
+    },
+    {
+      "description": "cinatra-ai/.github reusable-workflow callers that pin an UNTAGGED main snapshot carry a synthetic `-main.<shortsha>` version comment (no matching git tag exists). Renovate's github-tags datasource cannot resolve that pseudo-version, so it reports fleet-wide 'Could not determine new digest' package-lookup failures. Suppress updates for the snapshot pins only; a pin that names a real published tag is unaffected and stays Renovate-maintained. When a real tag ships at or above the snapshot, repin the caller (SHA + real-tag comment) and this rule stops matching.",
+      "matchManagers": ["github-actions"],
+      "matchPackageNames": ["cinatra-ai/.github"],
+      "matchCurrentValue": "/-main\\./",
+      "enabled": false
     }
   ]
 }
