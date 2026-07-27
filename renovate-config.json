@@ -22,6 +22,12 @@
       "matchPackageNames": ["cinatra-ai/.github"],
       "matchCurrentValue": "/-main\\./",
       "enabled": false
+    },
+    {
+      "description": "Hold TypeScript at the typescript-eslint peer ceiling until typescript-eslint ships TS7 support. Lift when supported.",
+      "matchManagers": ["npm"],
+      "matchPackageNames": ["typescript"],
+      "allowedVersions": "<6.1.0"
     }
   ]
 }
