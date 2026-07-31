@@ -28,6 +28,13 @@
       "matchManagers": ["npm"],
       "matchPackageNames": ["typescript"],
       "allowedVersions": "<6.1.0"
+    },
+    {
+      "description": "Hold pnpm below 11 on repos that have not migrated yet. pnpm 11 changed the default for the lockfile's `settings.autoInstallPeers`, so once Renovate bumps `packageManager` to pnpm 11 the corepack-driven `pnpm install --frozen-lockfile` in CI aborts with ERR_PNPM_LOCKFILE_CONFIG_MISMATCH against a lockfile written by pnpm 10 — before any lint or test runs (cinatra-ai/plane-connector#48). It does not self-heal: Renovate's own lockfile regeneration fails the same way. matchCurrentValue scopes the cap to callers that are still on pnpm 10 or older: the negated regex exempts any plain version whose major is 11 or above, so a repo that has already migrated keeps normal currency (and cannot be re-capped by a later major), while a non-plain value such as a `^10.0.0` range stays capped rather than falling through. Each repo therefore leaves this rule by itself once its packageManager and lockfile are moved to pnpm 11 together. Lift entirely when the org-wide pnpm 11 migration is scheduled as an upgrade-track item.",
+      "matchManagers": ["npm"],
+      "matchPackageNames": ["pnpm"],
+      "matchCurrentValue": "!/^(?:1[1-9]|[2-9][0-9]|[1-9][0-9]{2,})\\./",
+      "allowedVersions": "<11"
     }
   ]
 }
